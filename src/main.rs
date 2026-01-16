@@ -1,4 +1,5 @@
 use std::{convert::Infallible, sync::LazyLock};
+mod auth;
 mod config;
 mod server;
 #[macro_export]

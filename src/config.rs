@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, sync::LazyLock};
-
+mod auth;
 use crate::{config_dir, data_dir};
 pub static CONFIG: LazyLock<Config> = LazyLock::new(|| {
     let config_path = config_dir().join("config.toml");

@@ -28,9 +28,16 @@ async fn listen_unsecure(listener: TcpListener) {
         }
     }
 }
-fn simplify_path(path: &Path) -> PathBuf {
+#[inline(always)]
+fn simplify_path(path: &Path) -> Result<PathBuf, String> {
     todo!()
 }
+#[inline(always)]
+fn stream_end(data: &[u8]) -> Option<usize> {
+    data.windows(REQUEST_END.len())
+        .position(|w| w == REQUEST_END)
+}
+#[inline(always)]
 async fn get_handler<S>(
     stream: &mut BufStream<S>,
     addr: std::net::SocketAddr,
@@ -41,22 +48,43 @@ where
 {
     stream.write(REQUEST_START).await?;
     stream.write(b"OUT\r\n").await?;
-    let mut data = [0u8; 1024]; // read a kilobyte at a time to put in the output buffer
+    let mut data = Vec::new();
     let mut file = File::open(path).await?;
     loop {
         let n = file.read(&mut data).await?;
         if n == 0 {
-            return Ok(());
+            return Err("Stream ended before the end of the file".into());
         }
-        if let Some(pos) = data
-            .windows(REQUEST_END.len())
-            .position(|w| w == REQUEST_END)
-        {
+        if let Some(pos) = stream_end(&data) {
             stream.write(&data[..pos]).await?;
             return Ok(());
         } else {
             stream.write(&data).await?;
-            data.fill(0);
+            data.clear();
+        }
+    }
+}
+
+#[inline(always)]
+async fn put_handler<S>(
+    stream: &mut BufStream<S>,
+    addr: std::net::SocketAddr,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    stream.write(REQUEST_START).await?;
+    stream.write(b"ACK\r\n").await?;
+    let mut data = Vec::new();
+    let mut file = File::create(path).await?;
+    loop {
+        stream.read(&mut data).await?;
+        if let Some(pos) = stream_end(&data) {
+            file.write_all(&data[..pos]).await?;
+            return Ok(());
+        } else {
+            file.write_all(&data).await?;
         }
     }
 }
@@ -101,10 +129,7 @@ where
                     break;
                 }
                 if let Ok(path) = std::str::from_utf8(&data).map(Path::new) {
-                    if !path.starts_with("/") {
-                        log::warn!("Invalid path from {addr}");
-                    }
-                    let simple_path = simplify_path(path);
+                    let simple_path = simplify_path(path).expect("todo handle error");
                     match get_handler(&mut stream, addr, &simple_path).await {
                         Ok(()) => {
                             let _ = stream.write(REQUEST_END).await;
@@ -125,7 +150,74 @@ where
                     }
                 }
             }
-            b"PUT" =>
+            b"PUT" => {
+                data.clear();
+                if let Err(err) = stream.read_until(b'\n', &mut data).await {
+                    log::error!("Failed to read from socket: {err}");
+                    break;
+                }
+                if let Ok(path) = std::str::from_utf8(&data).map(Path::new) {
+                    if !path.starts_with("/") {
+                        log::warn!("Invalid path from {addr}");
+                    }
+                    let simple_path = simplify_path(path).expect("todo handle error");
+                    match put_handler(&mut stream, addr, &simple_path).await {
+                        Ok(()) => {
+                            let _ = stream.write(REQUEST_END).await;
+                        }
+                        Err(err) => {
+                            log::error!("Failed to put file: {err}");
+                            let _ = stream
+                                .write(
+                                    format!(
+                                        "{0}ERROR\r\nFailed to put file{1}",
+                                        std::str::from_utf8(REQUEST_START).unwrap(),
+                                        std::str::from_utf8(REQUEST_END).unwrap()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    log::warn!("Invalid Path from stream: {addr}");
+                    todo!("Handle Invalid stream");
+                }
+            }
+            b"DEL" => {
+                // next data in the stream should be the path
+                if let Err(err) = stream.read_until(b'\n', &mut data).await {
+                    log::error!("Failed to read from socket: {err}");
+                    break;
+                }
+                if let Ok(path) = std::str::from_utf8(&data).map(Path::new) {
+                    let simple_path = simplify_path(path).expect("todo handle error");
+                }
+            }
+            b"MKDIR" => {
+                todo!("MKDIR")
+            }
+            b"RMDIR" => {
+                todo!("RMDIR")
+            }
+            b"STAT" => {
+                todo!("STAT")
+            }
+            b"LIST" => {
+                todo!("LIST")
+            }
+            b"CD" => {
+                todo!("CD")
+            }
+            b"PWD" => {
+                todo!("PWD")
+            }
+            b"SLEEP" => {
+                todo!("Sleep awaiting for updates form other clients")
+            }
+            b"QUIT" => {
+                break;
+            }
             _ => {
                 log::warn!("Invalid command from {}", addr);
                 if let Err(err) = stream.read_until(b'\n', &mut data).await {
