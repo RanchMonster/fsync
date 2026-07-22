@@ -255,7 +255,10 @@ async fn test_find_ignores() {
 }
 #[tokio::test]
 async fn test_sync_tree() {
-    use tokio::{fs::File, io::AsyncWriteExt};
+    use tokio::{
+        fs::{File, remove_file},
+        io::AsyncWriteExt,
+    };
     let search_dir = std::env::current_dir().unwrap();
     let currnet_dir_name = search_dir.file_name().unwrap().to_str().unwrap();
     let mut tree = SyncTree::new(search_dir.clone(), None, None).await.unwrap();
@@ -277,4 +280,5 @@ async fn test_sync_tree() {
         }
     }
     assert!(detected_change, "No change detected");
+    remove_file(search_dir.join("test.txt")).await.unwrap();
 }
