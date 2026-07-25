@@ -127,7 +127,7 @@ docs/
 
 ## License
 
-> **TODO**: Add a license before publishing.
+This project is licensed under the [MIT License](LICENSE).
 
 ## Contributing
 
