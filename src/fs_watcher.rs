@@ -9,7 +9,6 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    fs::{File, canonicalize},
     sync::{Mutex, MutexGuard, RwLock, broadcast, mpsc},
     task::{self, JoinHandle},
 };
@@ -37,7 +36,6 @@ const DEFAULT_IGNORE_FILES: &[&str] = &[".gitignore", ".ignore", ".fsyncignore"]
 const FILE_EVENT_DELAY: Duration = Duration::from_secs(5); // Default time to wait before alerting the tree to the changes
 #[cfg(test)]
 const FILE_EVENT_DELAY: Duration = Duration::from_secs(0); // In tests we don't want to wait for the file events because the it is a controlled environment
-
 /// Error type for the local sync handler
 #[derive(Error, Debug)]
 pub enum LocalSyncError {
@@ -100,7 +98,7 @@ fn find_helper(path: PathBuf, tx: mpsc::Sender<Gitignore>) {
             tracing::error!(path=%path.display(), "Failed to build gitignore");
             return;
         };
-        tx.blocking_send(built).expect("Failed to send gitignore");
+        assert!(tx.blocking_send(built).is_ok(), "Failed to send gitignore");
     }
 }
 
@@ -308,13 +306,11 @@ async fn test_find_ignores() {
 }
 #[tokio::test]
 async fn test_ignore_rules() {
-    use tokio::fs;
+    use std::fs;
     let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
-    fs::remove_dir_all(&search_dir).await;
-    fs::create_dir(&search_dir).await.unwrap();
-    fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir")
-        .await
-        .unwrap();
+    fs::remove_dir_all(&search_dir).unwrap();
+    fs::create_dir(&search_dir).unwrap();
+    fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
     let mut ignores = IgnoreMap::new();
     ignores.load(search_dir.clone()).await.unwrap();
     assert!(
@@ -332,19 +328,16 @@ async fn test_ignore_rules() {
 }
 #[tokio::test]
 async fn test_sync_logic() {
-    use tokio::fs;
     let search_dir = std::env::temp_dir().join("fsync_test_sync_logic");
-    fs::remove_dir_all(&search_dir).await;
-    fs::create_dir(&search_dir).await.unwrap();
+    let _ = std::fs::remove_dir_all(&search_dir);
+    std::fs::create_dir(&search_dir).unwrap();
 
     let mut watcher = WatcherThread::init().expect("Failed to initialize watcher");
     let mut sub = watcher
         .subscribe(search_dir.clone())
         .await
         .expect("Failed to subscribe to watcher");
-    fs::write(&search_dir.join("test.txt"), "Hello World")
-        .await
-        .unwrap();
+    std::fs::write(&search_dir.join("test.txt"), "Hello World").unwrap();
     if let Ok(events) = sub.recv().await {
         assert!(
             events
@@ -353,9 +346,7 @@ async fn test_sync_logic() {
             "test.txt should be created\n{events:?}"
         );
     }
-    fs::write(&search_dir.join("test.txt"), "Hello World2")
-        .await
-        .unwrap();
+    std::fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
     if let Ok(events) = sub.recv().await {
         assert!(
             events
@@ -364,9 +355,7 @@ async fn test_sync_logic() {
             "test.txt should be modified\n{events:?}"
         );
     }
-    fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt"))
-        .await
-        .unwrap();
+    std::fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt")).unwrap();
     if let Ok(events) = sub.recv().await {
         assert!(
             events
@@ -374,9 +363,7 @@ async fn test_sync_logic() {
                 .any(|event| event.paths.contains(&search_dir.join("test2.txt")))
         );
     }
-    fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt"))
-        .await
-        .unwrap();
+    std::fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt")).unwrap();
     if let Ok(events) = sub.recv().await {
         assert!(
             events
@@ -384,9 +371,7 @@ async fn test_sync_logic() {
                 .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
         );
     }
-    fs::remove_file(&search_dir.join("test3.txt"))
-        .await
-        .unwrap();
+    std::fs::remove_file(&search_dir.join("test3.txt")).unwrap();
     if let Ok(events) = sub.recv().await {
         assert!(
             events
