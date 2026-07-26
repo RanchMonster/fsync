@@ -73,7 +73,16 @@ they guide where the project is going.
    approved. Either a user approves it, or an existing peer vouches for it.
 
 ### Contributing Rules
-
+1. All PRs have to be reviewed by either a maintainer or long-time contributor.
+2. All PRs should be obviously what a PR accomplishes just by title and or description.
+3. All PR approval workflows must pass.
+4. Never abraviate names.
+5. Negative programming perference.
+6. State assertions are required (they must be debug_assertions for costly checks).
+7. Don't put types in your names.
+8. Put units in names.
+9. All rust enforced naming conventions must be followed.
+10. Avoid large dependencie trees.
 > **TODO**: Add your own rules here. This section is for project-specific
 > contribution guidelines, code style, PR process, etc.
 
