@@ -308,7 +308,7 @@ async fn test_find_ignores() {
 async fn test_ignore_rules() {
     use std::fs;
     let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
-    fs::remove_dir_all(&search_dir).unwrap();
+    let _ = fs::remove_dir_all(&search_dir);
     fs::create_dir(&search_dir).unwrap();
     fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
     let mut ignores = IgnoreMap::new();
