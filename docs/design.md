@@ -79,7 +79,7 @@ Key is persisted to disk so the peer ID is stable across restarts.
 
 ## Discovery (mdns-sd)
 
-- Service type: `_fsync._tcp.local.`
+- Service type: `_fsync._udp.local.`
 - Instance name: env `FSYNC_PEER_NAME` or system hostname (truncated to 15 chars per RFC 6763)
 - Runs its own daemon thread, bridges to async via flume channels
 - Each peer both advertises (register) and discovers (browse)
