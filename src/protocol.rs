@@ -1,38 +1,67 @@
 mod error;
 pub use error::{Error, Result};
-use mdns_sd::{IntoTxtProperties, Receiver, ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock},
-};
+use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::sync::Arc;
 use tokio::{
-    net::ToSocketAddrs,
     sync::Mutex,
     task::{self, JoinHandle},
 };
+use tracing::instrument;
 
-use crate::sync_logic::SyncTree;
-const SERVICE_TYPE: &str = "_fsync._tcp.local.";
+const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 /// Represents a peer in the network this is mostly like not the actual peer but is a placeholder
 /// until I have figure out what I actual need to know about a peer
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Peer {
     version: String,
-    address: String,
+    addresses: Vec<String>,
+    hostname: String,
     port: u16,
 }
+impl TryFrom<ResolvedService> for Peer {
+    type Error = Error;
+    #[instrument]
+    fn try_from(resolved: ResolvedService) -> Result<Self> {
+        let version = resolved
+            .txt_properties
+            .get(VERSION_KEY_PROPERTY)
+            .ok_or(Error::InvalidPeer(resolved.clone()))?
+            .val()
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .unwrap_or_default()
+            .to_string();
+        let addresses = resolved
+            .addresses
+            .iter()
+            .map(|address| address.to_ip_addr().to_canonical().to_string())
+            .collect();
+        let hostname = resolved.get_hostname().to_string();
+        let port = resolved.port;
+        Ok(Peer {
+            version,
+            addresses,
+            hostname,
+            port,
+        })
+    }
+}
+
 impl Peer {
     pub fn compatible(&self) -> bool {
         todo!("check if the peer is compatible")
     }
+
     pub fn version(&self) -> &str {
         &self.version
     }
-    pub fn address(&self) -> &str {
-        &self.address
+    /// Find the first valid address
+    /// This function is not yet implemented and will require
+    /// a custom endpoint for QUIC I will implement this when I get to QUIC
+    pub async fn valid_address(&self) -> &str {
+        todo!("find the first valid address")
     }
     pub fn port(&self) -> u16 {
         self.port
@@ -55,11 +84,16 @@ pub struct ServiceScanner<'daemon> {
 }
 impl<'daemon> ServiceScanner<'daemon> {
     pub async fn next_peer(&mut self) -> Option<Peer> {
-        let event = self.inner.recv_async().await.ok()?;
-        todo!("implement next peer")
+        use ServiceEvent::*;
+        loop {
+            let event = self.inner.recv_async().await.ok()?;
+            if let ServiceResolved(resolved) = event {
+                return (*resolved).try_into().ok();
+            }
+        }
     }
 }
-struct Service {
+pub struct Service {
     daemon: Option<ServiceDaemon>,
     peers: Arc<Mutex<Vec<Peer>>>,
     join_handle: Option<JoinHandle<()>>,
@@ -83,7 +117,7 @@ impl Service {
     pub async fn connected(&self) -> Vec<Peer> {
         (*self.peers.lock().await).clone()
     }
-    pub async fn start(&mut self, trees: Vec<SyncTree>) -> Result<()> {
+    pub async fn start(&mut self) -> Result<()> {
         task::spawn(async move { todo!("start the service") });
         Ok(())
     }
@@ -130,7 +164,7 @@ impl Service {
             let service_info = ServiceInfo::new(
                 SERVICE_TYPE,
                 &hostname,
-                format!("{hostname}.local").as_str(),
+                format!("{hostname}.local.").as_str(),
                 address,
                 port,
                 [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
@@ -141,7 +175,7 @@ impl Service {
             Ok::<_, Error>(mdns)
         })
         .await;
-        let mdns = mdns.expect("Failed to start advertising service state damaged")?;
+        let mdns = mdns.expect("Thread unexpectedly panicked")?;
         self.daemon = Some(mdns);
         Ok(())
     }
