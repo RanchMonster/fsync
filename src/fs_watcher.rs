@@ -308,7 +308,6 @@ async fn test_find_ignores() {
 async fn test_ignore_rules() {
     use std::fs;
     let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
-    let _ = fs::remove_dir_all(&search_dir);
     fs::create_dir(&search_dir).unwrap();
     fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
     let mut ignores = IgnoreMap::new();
@@ -325,11 +324,11 @@ async fn test_ignore_rules() {
         ignores.is_ignore(&search_dir.join("test_dir")),
         "test_dir should be ignored",
     );
+    let _ = fs::remove_dir_all(&search_dir);
 }
 #[tokio::test]
 async fn test_sync_logic() {
     let search_dir = std::env::temp_dir().join("fsync_test_sync_logic");
-    let _ = std::fs::remove_dir_all(&search_dir);
     std::fs::create_dir(&search_dir).unwrap();
 
     let mut watcher = WatcherThread::init().expect("Failed to initialize watcher");
@@ -380,4 +379,5 @@ async fn test_sync_logic() {
             "test3.txt should be removed\n{events:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(&search_dir);
 }
