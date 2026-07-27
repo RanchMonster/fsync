@@ -186,3 +186,23 @@ impl Service {
         Ok(())
     }
 }
+
+// This test case might change in the future after I get QUIC implemented
+#[tokio::test]
+async fn mmdns_service_testdns_service_test() {
+    let mut service = Service::new().await;
+    service.advertise().await.unwrap();
+    let mut scanner = service.discover_peers().await.unwrap();
+    let hostname = hostname::get().unwrap().to_string_lossy().to_string();
+    while let Some(peer) = scanner.next_peer().await {
+        if peer
+            .hostname
+            .strip_suffix(".local.")
+            .expect("Hostname must end with .local.")
+            == hostname
+        {
+            return;
+        }
+    }
+    panic!("Failed to find self in peer list");
+}
