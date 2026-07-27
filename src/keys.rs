@@ -10,7 +10,10 @@ pub fn get_signing_key() -> KeyPair {
    let private_key_path = CONFIG_DIR.join("key.private");
    if !private_key_path.exists() {
       let key_pair = generate_ed25519_keypair();
-      assert!(key_pair.algorithm() == &PKCS_ED25519);
+      assert!(
+         key_pair.algorithm() == &PKCS_ED25519,
+         "Key algorithm is not ED25519"
+      );
       store_key_pair(&key_pair);
       return key_pair;
    }
