@@ -43,19 +43,16 @@ pub fn store_key_pair(key_pair: &KeyPair) {
 }
 
 #[cfg(test)]
-/// Clears key storage from the filesystem.
-///
-/// **TEST ONLY**
-pub fn clear_keys() {
-   let private_key_path = CONFIG_DIR.join("key.private");
-   assert!(private_key_path.exists());
-   assert!(private_key_path.is_file());
-   std::fs::remove_file(private_key_path).expect("Failed to remove private key");
-}
-
-#[cfg(test)]
 mod tests {
    use super::*;
+
+   /// Clears key storage from the filesystem.
+   pub fn clear_keys() {
+      let private_key_path = CONFIG_DIR.join("key.private");
+      assert!(private_key_path.exists());
+      assert!(private_key_path.is_file());
+      std::fs::remove_file(private_key_path).expect("Failed to remove private key");
+   }
 
    #[test]
    fn test_generate_ed25519_keypair() {
