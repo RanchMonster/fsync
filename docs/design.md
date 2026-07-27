@@ -35,8 +35,8 @@ fsync is a decentralized peer-to-peer file synchronization system. Devices on th
 - [x] File watching with notify
 - [x] Ignore system (.gitignore, .ignore, .fsyncignore)
 - [x] Debounced event batching
-- [ ] mDNS service registration and browsing
-- [ ] Peer discovery on LAN
+- [x] mDNS service registration and browsing
+- [x] Peer discovery on LAN
 
 ### Phase 2: Encrypted Transport
 - [ ] QUIC via quinn
