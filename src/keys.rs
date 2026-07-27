@@ -1,8 +1,8 @@
 use rcgen::{KeyPair, PKCS_ED25519};
-use std::{
-   fs::{read_to_string, write},
-   os::unix::fs::PermissionsExt,
-};
+use std::fs::{read_to_string, write};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::CONFIG_DIR;
 
@@ -32,13 +32,16 @@ pub fn generate_ed25519_keypair() -> KeyPair {
 pub fn store_key_pair(key_pair: &KeyPair) {
    let private_key_path = CONFIG_DIR.join("key.private");
    let key_pem = key_pair.serialize_pem();
-   write(&private_key_path, "").expect("Failed to write private key");
-   assert!(&private_key_path.exists());
-   &private_key_path
-      .metadata()
-      .expect("Failed to get metadata")
-      .permissions()
-      .set_mode(0o600);
+   #[cfg(unix)]
+   {
+      write(&private_key_path, "").expect("Failed to write private key");
+      assert!(&private_key_path.exists());
+      &private_key_path
+         .metadata()
+         .expect("Failed to get metadata")
+         .permissions()
+         .set_mode(0o600);
+   }
    write(private_key_path, key_pem).expect("Failed to write private key");
 }
 
