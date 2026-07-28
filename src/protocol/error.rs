@@ -20,5 +20,8 @@ pub enum Error {
    /// Malformed peer
    #[error("Invalid peer information")]
    InvalidPeer(mdns_sd::ResolvedService),
+   /// Network error
+   #[error("Network error")]
+   NetworkError(#[from] std::io::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
