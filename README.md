@@ -85,7 +85,7 @@ they guide where the project is going.
 10. Avoid large dependencie trees.
 11. Any commits that include format changes should not include code changes.
 12. All tests must clean up after themselves (any files created must be removed).
-13. All tests cases must be deterministic.
+13. All test cases must be deterministic.
 
 #### Commit Message Format
 
