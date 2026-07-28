@@ -84,7 +84,9 @@ they guide where the project is going.
 9. All rust enforced naming conventions must be followed.
 10. Avoid large dependencie trees.
 11. Any commits that include format changes should not include code changes.
-12. If you have implemented a change requested by a review comment: reply with a link to the commit.
+12. All tests must clean up after themselves (any files created must be removed).
+13. All test cases must be deterministic.
+14. If you have implemented a change requested by a review comment: reply with a link to the commit.
 > **TODO**: Add your own rules here. This section is for project-specific
 > contribution guidelines, code style, PR process, etc.
 
