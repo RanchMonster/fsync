@@ -48,7 +48,8 @@ pub fn store_key_pair(key_pair: &KeyPair) {
 #[cfg(test)]
 mod tests {
    use super::*;
-
+   use std::sync::{Mutex, MutexGuard};
+   static SINGLETON_RUN: Mutex<()> = Mutex::new(());
    /// Clears key storage from the filesystem.
    pub fn clear_keys() {
       let private_key_path = CONFIG_DIR.join("key.private");
@@ -56,15 +57,30 @@ mod tests {
       assert!(private_key_path.is_file());
       std::fs::remove_file(private_key_path).expect("Failed to remove private key");
    }
-
+   fn ensure_singleton() -> MutexGuard<'static, ()> {
+      let guard = match SINGLETON_RUN.lock() {
+         Ok(guard) => guard,
+         Err(_) => {
+            SINGLETON_RUN.clear_poison();
+            SINGLETON_RUN.lock().expect("Failed to lock mutex")
+         }
+      };
+      let private_key_path = CONFIG_DIR.join("key.private");
+      if private_key_path.exists() {
+         std::fs::remove_file(private_key_path).expect("Failed to remove private key");
+      }
+      guard
+   }
    #[test]
    fn test_generate_ed25519_keypair() {
+      let _guard = ensure_singleton();
       let key_pair = generate_ed25519_keypair();
       assert!(key_pair.algorithm() == &PKCS_ED25519);
    }
 
    #[test]
    fn test_storage_and_retrieval_of_key_pair() {
+      let _guard = ensure_singleton();
       let key_pair = generate_ed25519_keypair();
       store_key_pair(&key_pair);
       let retrieved_key_pair = get_signing_key();
@@ -77,6 +93,7 @@ mod tests {
 
    #[test]
    fn test_clear_key_pair() {
+      let _guard = ensure_singleton();
       let key_pair = generate_ed25519_keypair();
       store_key_pair(&key_pair);
       clear_keys();
