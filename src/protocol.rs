@@ -28,8 +28,9 @@ fn make_server_config() -> quinn::ServerConfig {
    let rustls_config = rustls::ServerConfig::builder()
       .with_no_client_auth()
       .with_single_cert(vec![cert.der().clone()], keypair.into())
-      .unwrap();
-   let quic_config = QuicServerConfig::try_from(rustls_config).unwrap();
+      .expect("Failed to create rustls config");
+   let quic_config =
+      QuicServerConfig::try_from(rustls_config).expect("Failed to create quic config");
 
    quinn::ServerConfig::with_crypto(Arc::new(quic_config))
 }
