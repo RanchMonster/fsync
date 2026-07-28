@@ -97,6 +97,7 @@ pub struct Service {
     daemon: Option<ServiceDaemon>,
     peers: Arc<Mutex<Vec<Peer>>>,
     join_handle: Option<JoinHandle<()>>,
+    is_advertising: bool,
 }
 impl Service {
     pub async fn new() -> Self {
@@ -104,6 +105,7 @@ impl Service {
             daemon: None,
             peers: Arc::new(Mutex::new(Vec::new())),
             join_handle: None,
+            is_advertising: false,
         }
     }
     pub async fn stop(&mut self) -> Result<()> {
@@ -140,6 +142,7 @@ impl Service {
         Ok(scanner)
     }
     pub async fn advertise(&mut self) -> Result<()> {
+        assert!(!self.is_advertising, "Service was already advertising");
         let daemon = self.daemon.take();
         let mdns = task::spawn_blocking(move || {
             let mdns = unwrap_or_create_daemon!(daemon);
@@ -181,6 +184,10 @@ impl Service {
     }
     async fn stop_advertising(&mut self) -> Result<()> {
         if let Some(daemon) = &mut self.daemon {
+            assert!(
+                self.is_advertising,
+                "Service was not advertising before stopping"
+            );
             daemon.unregister(SERVICE_TYPE)?;
         }
         Ok(())
