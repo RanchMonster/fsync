@@ -1,10 +1,5 @@
 edition = "2024"
 max_width = 100
-indent_style = "Space"
 tab_spaces = 3
-fn_params_layout = "Tail"
-match_arm_blocks = true
-imports_granularity = "Crate"
-group_imports = "StdExternalLocal"
-trailing_comma = "Vertical"
+fn_params_layout = "Compressed"
 use_small_heuristics = "Default"
