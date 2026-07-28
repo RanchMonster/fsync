@@ -160,3 +160,100 @@ impl ServerCertVerifier for PeerVerifier {
       Ok(ServerCertVerified::assertion())
    }
 }
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use std::fs;
+
+   fn setup() {
+      let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+      let path = crate::CONFIG_DIR.join("known_peers");
+      if !path.exists() {
+         fs::write(&path, "").expect("Failed to create test known_peers file");
+      }
+   }
+
+   fn cleanup_known_peers() {
+      let path = crate::CONFIG_DIR.join("known_peers");
+      let _ = fs::remove_file(path);
+   }
+
+   fn generate_test_cert() -> (CertificateDer<'static>, [u8; 32]) {
+      let rcgen::CertifiedKey { cert, .. } =
+         rcgen::generate_simple_self_signed(vec!["test-peer".to_string()]).unwrap();
+      let cert_der = cert.der().clone();
+      let (_, parsed) = x509_parser::parse_x509_certificate(cert_der.as_ref()).unwrap();
+      let public_key = &parsed.public_key().subject_public_key.data;
+      let hash = blake3::hash(public_key);
+      let peer_id = *hash.as_bytes();
+      (cert_der, peer_id)
+   }
+
+   #[test]
+   fn test_fingerprint() {
+      setup();
+      let key = [0xAB; 32];
+      let fp = fingerprint(&key);
+      assert_eq!(fp.len(), 16, "fingerprint should be 16 hex chars");
+      assert_eq!(fp, fingerprint(&key), "fingerprint should be deterministic");
+      assert_ne!(fp, fingerprint(&[0xCD; 32]));
+   }
+
+   #[test]
+   fn test_add_and_fetch_round_trip() {
+      setup();
+      let peer_id = [0x42; 32];
+      fs::write(crate::CONFIG_DIR.join("known_peers"), "").unwrap();
+      add_known_peer("alice".into(), peer_id);
+
+      let result = fetch_known_peer("alice".into());
+      assert!(result.is_some(), "should find alice");
+      assert_eq!(result.unwrap().expected_peer_id, peer_id);
+
+      assert!(fetch_known_peer("bob".into()).is_none());
+
+      // Malformed lines are skipped, not panicked
+      fs::write(
+         crate::CONFIG_DIR.join("known_peers"),
+         "bad line here\nvalid_peer 0000000000000000000000000000000000000000000000000000000000000000\n",
+      )
+      .unwrap();
+      let result = fetch_known_peer("valid_peer".into());
+      assert!(result.is_some());
+
+      cleanup_known_peers();
+   }
+
+   #[test]
+   fn test_verify_server_cert_accepted() {
+      setup();
+      let (cert_der, peer_id) = generate_test_cert();
+      let verifier = PeerVerifier {
+         expected_peer_id: peer_id,
+         supported: rustls::crypto::CryptoProvider::get_default()
+            .unwrap()
+            .signature_verification_algorithms,
+      };
+
+      let server_name = ServerName::try_from("test-peer").unwrap();
+      let result = verifier.verify_server_cert(&cert_der, &[], &server_name, &[], UnixTime::now());
+      assert!(result.is_ok(), "should accept matching peer");
+   }
+
+   #[test]
+   fn test_verify_server_cert_wrong_peer() {
+      setup();
+      let (cert_der, _) = generate_test_cert();
+      let verifier = PeerVerifier {
+         expected_peer_id: [0xFF; 32],
+         supported: rustls::crypto::CryptoProvider::get_default()
+            .unwrap()
+            .signature_verification_algorithms,
+      };
+
+      let server_name = ServerName::try_from("test-peer").unwrap();
+      let result = verifier.verify_server_cert(&cert_der, &[], &server_name, &[], UnixTime::now());
+      assert!(result.is_err(), "should reject mismatched peer");
+   }
+}
