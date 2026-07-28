@@ -76,7 +76,7 @@ pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
    }
    None
 }
-struct PeerVerifier {
+pub struct PeerVerifier {
    expected_peer_id: [u8; 32],
    supported: WebPkiSupportedAlgorithms,
 }
