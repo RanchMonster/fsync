@@ -11,6 +11,18 @@ use rustls::{
 use tracing::instrument;
 
 /// Fingerprints a public key as a Hex string of 8 bytes
+/// This function is intended for user verification
+/// ```
+/// let human_readable_fingerprint = fingerprint(&new_peer_public_key);
+/// println!("Verify the fingerprint of the new device: {human_readable_fingerprint}");
+/// print!("Do you want to trust this device? [y/n]: ");
+/// let mut input = String::new();
+/// std::io::stdin().read_line(&mut input).expect("Failed to read input");
+/// if input.trim().to_lowercase() == "y" {
+///     // Add the new peer to the trusted list
+/// }
+/// ```
+///
 pub fn fingerprint(public_key: &[u8]) -> String {
    let hash = blake3::hash(public_key);
    hash
