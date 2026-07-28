@@ -89,7 +89,6 @@ they guide where the project is going.
 14. If you have implemented a change requested by a review comment: reply with a link to the commit.
 > **TODO**: Add your own rules here. This section is for project-specific
 > contribution guidelines, code style, PR process, etc.
->>>>>>> master
 
 #### Commit Message Format
 
