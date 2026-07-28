@@ -12,7 +12,8 @@ use tracing::instrument;
 
 /// Fingerprints a public key as a Hex string of 8 bytes
 /// This function is intended for user verification
-/// ```
+/// ```no_run
+/// # let new_peer_public_key: &[u8] = &[];
 /// let human_readable_fingerprint = fingerprint(&new_peer_public_key);
 /// println!("Verify the fingerprint of the new device: {human_readable_fingerprint}");
 /// print!("Do you want to trust this device? [y/n]: ");
@@ -45,7 +46,7 @@ pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
          continue;
       }
       let name = items[0];
-      assert!(name.len() > 0, "Known peer name must not be empty");
+      assert!(!name.is_empty(), "Known peer name must not be empty");
       assert!(
          name.len() <= 15,
          "Known peer name must be at most 15 characters"
@@ -61,10 +62,13 @@ pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
             continue;
          }
       };
-      assert!(
-         decoded_peer_id.len() == 32,
-         "Peer ID must be 32 bytes exactly"
-      );
+      if decoded_peer_id.len() != 32 {
+         tracing::error!(
+            "Peer ID must be 32 bytes exactly, got {} on line: {line}",
+            decoded_peer_id.len()
+         );
+         continue;
+      }
       return Some(PeerVerifier {
          expected_peer_id: decoded_peer_id
             .try_into()
@@ -78,9 +82,29 @@ pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
 }
 #[instrument]
 pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
-   let peer_id = hex::encode(peer_id);
+   assert!(!peer_name.is_empty(), "Peer name must not be empty");
+   assert!(
+      peer_name.len() <= 15,
+      "Peer name must be at most 15 characters"
+   );
+   assert!(
+      !peer_name.contains(char::is_whitespace),
+      "Peer name must not contain whitespace"
+   );
+
    let path = crate::CONFIG_DIR.join("known_peers");
    assert!(path.exists(), "Known peers file does not exist");
+
+   if let Some(existing) = fetch_known_peer(peer_name.clone()) {
+      if existing.expected_peer_id != peer_id {
+         tracing::warn!("Peer {peer_name} already exists with a different ID, overwriting");
+      } else {
+         tracing::info!("Peer {peer_name} already exists with the same ID, skipping");
+         return;
+      }
+   }
+
+   let peer_id = hex::encode(peer_id);
    let mut file = File::options()
       .append(true)
       .open(path)
@@ -114,7 +138,7 @@ impl ServerCertVerifier for PeerVerifier {
    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
       self.supported.supported_schemes()
    }
-   #[instrument]
+   #[instrument(skip(end_entity, _intermediates, _ocsp_response))]
    fn verify_server_cert(
       &self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
       _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
