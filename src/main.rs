@@ -21,7 +21,7 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
          create_dir_all(&path).expect("Failed to create test config dir.");
       }
       return path;
-      }
+   }
    #[cfg(not(test))]
    {
       let path = dirs::home_dir().unwrap().join(".fsync");
