@@ -17,5 +17,8 @@ pub enum Error {
     /// Rejected by a fellow peer
     #[error("Rejected by a fellow peer")]
     PeerRejected,
+    /// Malformed peer
+    #[error("Invalid peer information")]
+    InvalidPeer(mdns_sd::ResolvedService),
 }
 pub type Result<T> = std::result::Result<T, Error>;
