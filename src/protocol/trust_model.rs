@@ -1,6 +1,6 @@
 use std::{
    fs::File,
-   io::{BufRead, BufReader},
+   io::{BufRead, BufReader, Write},
 };
 
 use rustls::{
@@ -75,6 +75,17 @@ pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
       });
    }
    None
+}
+#[instrument]
+pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
+   let peer_id = hex::encode(peer_id);
+   let path = crate::CONFIG_DIR.join("known_peers");
+   assert!(path.exists(), "Known peers file does not exist");
+   let mut file = File::options()
+      .append(true)
+      .open(path)
+      .expect("Failed to open known peers file");
+   writeln!(file, "{peer_name} {peer_id}").expect("Failed to write to known peers file");
 }
 pub struct PeerVerifier {
    expected_peer_id: [u8; 32],
