@@ -149,7 +149,7 @@ impl ServerCertVerifier for PeerVerifier {
       // substr the name to 15 characters (without cloning the string to avoid allocating)
 
       let full_name = server_name.to_str();
-      let max_name_length = 15.max(full_name.len());
+      let max_name_length = 15.min(full_name.len());
       let peer_name = &full_name[..max_name_length];
 
       let Some(expected_peer_id) = fetch_known_peer(peer_name) else {
