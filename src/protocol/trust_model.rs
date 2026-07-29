@@ -1,8 +1,8 @@
 use std::{
-    cell::RefCell,
-    fs::File,
-    io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
+   cell::RefCell,
+   fs::File,
+   io::{BufRead, BufReader, Read, Write},
+   path::PathBuf,
 };
 
 use crate::CONFIG_DIR;
@@ -19,9 +19,12 @@ thread_local! {
 }
 
 fn resolve_known_peers_path() -> PathBuf {
-    KNOWN_PEERS_OVERRIDE.with(|cell| {
-        cell.borrow().clone().unwrap_or_else(|| CONFIG_DIR.join("known_peers"))
-    })
+   KNOWN_PEERS_OVERRIDE.with(|cell| {
+      cell
+         .borrow()
+         .clone()
+         .unwrap_or_else(|| CONFIG_DIR.join("known_peers"))
+   })
 }
 
 fn decode_hex_peer_id(hex_peer_id: &str) -> Result<[u8; 32], hex::FromHexError> {
@@ -63,8 +66,8 @@ pub fn fingerprint(public_key: &[u8]) -> String {
 
 #[instrument]
 pub fn fetch_known_peer(peer_name: &str) -> Option<[u8; 32]> {
-    let path = resolve_known_peers_path();
-    assert!(path.exists(), "Known peers file does not exist");
+   let path = resolve_known_peers_path();
+   assert!(path.exists(), "Known peers file does not exist");
    let file = BufReader::new(File::open(path).expect("Failed to open known peers file"));
    let buffered = BufReader::new(file);
 
@@ -106,22 +109,22 @@ pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
       "Peer name must not contain whitespace"
    );
 
-    let path = resolve_known_peers_path();
-    assert!(path.exists(), "Known peers file does not exist");
+   let path = resolve_known_peers_path();
+   assert!(path.exists(), "Known peers file does not exist");
 
-    if fetch_known_peer(&peer_name).is_some() {
+   if fetch_known_peer(&peer_name).is_some() {
       tracing::warn!(
          "Peer {peer_name} already known if you are trying to update the peer ID you will need to remove the old peer first"
       );
       return;
    }
 
-    let peer_id = hex::encode(peer_id);
-    let mut file = File::options()
-        .read(true)
-        .append(true)
-        .open(path)
-        .expect("Failed to open known peers file");
+   let peer_id = hex::encode(peer_id);
+   let mut file = File::options()
+      .read(true)
+      .append(true)
+      .open(path)
+      .expect("Failed to open known peers file");
    if file.metadata().expect("Failed to get metadata").len() > 0 {
       let mut last_char = [0];
       file
@@ -185,50 +188,49 @@ impl ServerCertVerifier for PeerVerifier {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::{fs, sync::OnceLock};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    fn setup() -> &'static (CertificateDer<'static>, CertificateDer<'static>) {
-        static CERTS: OnceLock<(CertificateDer<'static>, CertificateDer<'static>)> =
-            OnceLock::new();
-        static PEER_IDS: OnceLock<([u8; 32], [u8; 32])> = OnceLock::new();
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+   use super::*;
+   use std::sync::atomic::{AtomicU64, Ordering};
+   use std::{fs, sync::OnceLock};
+   static COUNTER: AtomicU64 = AtomicU64::new(0);
+   fn setup() -> &'static (CertificateDer<'static>, CertificateDer<'static>) {
+      static CERTS: OnceLock<(CertificateDer<'static>, CertificateDer<'static>)> = OnceLock::new();
+      static PEER_IDS: OnceLock<([u8; 32], [u8; 32])> = OnceLock::new();
+      let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-        CERTS.get_or_init(|| {
-            let test_peer = generate_test_cert();
-            let alice = generate_test_cert();
-            PEER_IDS.set((test_peer.1, alice.1)).unwrap();
-            (test_peer.0, alice.0)
-        });
+      CERTS.get_or_init(|| {
+         let test_peer = generate_test_cert();
+         let alice = generate_test_cert();
+         PEER_IDS.set((test_peer.1, alice.1)).unwrap();
+         (test_peer.0, alice.0)
+      });
 
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("fsync_known_peers_{id}"));
+      let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+      let path = std::env::temp_dir().join(format!("fsync_known_peers_{id}"));
 
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .unwrap();
-        writeln!(f, "bad line here").unwrap();
-        writeln!(
-            f,
-            "valid_peer 0000000000000000000000000000000000000000000000000000000000000000"
-        )
-        .unwrap();
-        drop(f);
+      let mut f = fs::OpenOptions::new()
+         .write(true)
+         .create(true)
+         .truncate(true)
+         .open(&path)
+         .unwrap();
+      writeln!(f, "bad line here").unwrap();
+      writeln!(
+         f,
+         "valid_peer 0000000000000000000000000000000000000000000000000000000000000000"
+      )
+      .unwrap();
+      drop(f);
 
-        KNOWN_PEERS_OVERRIDE.with(|cell| {
-            *cell.borrow_mut() = Some(path);
-        });
+      KNOWN_PEERS_OVERRIDE.with(|cell| {
+         *cell.borrow_mut() = Some(path);
+      });
 
-        let peer_ids = PEER_IDS.get().unwrap();
-        add_known_peer("test-peer".into(), peer_ids.0);
-        add_known_peer("alice".into(), peer_ids.1);
+      let peer_ids = PEER_IDS.get().unwrap();
+      add_known_peer("test-peer".into(), peer_ids.0);
+      add_known_peer("alice".into(), peer_ids.1);
 
-        CERTS.get().unwrap()
-    }
+      CERTS.get().unwrap()
+   }
 
    fn generate_test_cert() -> (CertificateDer<'static>, [u8; 32]) {
       let rcgen::CertifiedKey { cert, .. } =
