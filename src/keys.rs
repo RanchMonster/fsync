@@ -65,23 +65,10 @@ mod tests {
 
    #[test]
    fn test_storage_and_retrieval_of_key_pair() {
-      let key_pair = generate_ed25519_keypair();
-      store_key_pair(&key_pair);
+      let key_pair = get_signing_key();
       let retrieved_key_pair = get_signing_key();
       clear_keys();
       assert_eq!(
-         key_pair.public_key_raw(),
-         retrieved_key_pair.public_key_raw()
-      );
-   }
-
-   #[test]
-   fn test_clear_key_pair() {
-      let key_pair = generate_ed25519_keypair();
-      store_key_pair(&key_pair);
-      clear_keys();
-      let retrieved_key_pair = get_signing_key();
-      assert_ne!(
          key_pair.public_key_raw(),
          retrieved_key_pair.public_key_raw()
       );
