@@ -8,7 +8,7 @@ build:
    cargo build
 
 test:
-   cargo test -- --test-threads=1
+   cargo test
 
 check:
    cargo check
