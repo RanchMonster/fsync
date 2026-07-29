@@ -1,14 +1,25 @@
 use std::{
    fs::File,
-   io::{BufRead, BufReader, Write},
+   io::{BufRead, BufReader, Read, Write},
 };
 
+use hex::FromHexError;
 use rustls::{
    client::danger::{ServerCertVerified, ServerCertVerifier},
    crypto::WebPkiSupportedAlgorithms,
    pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use tracing::instrument;
+
+fn decode_hex_peer_id(hex_peer_id: &str) -> Result<[u8; 32], hex::FromHexError> {
+   let decoded_peer_id = hex::decode(hex_peer_id)?;
+   if decoded_peer_id.len() != 32 {
+      return Err(FromHexError::InvalidStringLength);
+   }
+   Ok(decoded_peer_id
+      .try_into()
+      .expect("Failed to convert to array"))
+}
 
 /// Fingerprints a public key as a Hex string of 8 bytes
 /// This function is intended for user verification
@@ -33,52 +44,36 @@ pub fn fingerprint(public_key: &[u8]) -> String {
       .map(|byte| format!("{byte:02x}"))
       .collect::<String>()
 }
+
 #[instrument]
-pub fn fetch_known_peer(peer_name: String) -> Option<PeerVerifier> {
+pub fn fetch_known_peer(peer_name: &str) -> Option<[u8; 32]> {
    let path = crate::CONFIG_DIR.join("known_peers");
    assert!(path.exists(), "Known peers file does not exist");
    let file = BufReader::new(File::open(path).expect("Failed to open known peers file"));
-   for line in file.lines() {
+   let buffered = BufReader::new(file);
+
+   // I thought about it and found that actually just using a iterator is faster and more memory efficient (I can send you the articles and videos if you want)
+   buffered.lines().find_map(|line| {
       let line = line.expect("Failed to read line");
-      let items = line.split_whitespace().collect::<Vec<&str>>();
-      if items.len() != 2 {
+      let mut fields = line.split_whitespace();
+      let (Some(name), Some(hex_peer_id)) = (fields.next(), fields.next()) else {
          tracing::warn!("Invalid known peer line: {line}");
-         continue;
-      }
-      let name = items[0];
-      assert!(!name.is_empty(), "Known peer name must not be empty");
-      assert!(
-         name.len() <= 15,
-         "Known peer name must be at most 15 characters"
-      );
-      if name != peer_name {
-         continue;
-      }
-      let hex_peer_id = items[1];
-      let decoded_peer_id = match hex::decode(hex_peer_id) {
-         Ok(decoded) => decoded,
-         Err(err) => {
-            tracing::error!("Failed to decode peer ID line: {line} due to error {err}");
-            continue;
-         }
+         return None;
       };
-      if decoded_peer_id.len() != 32 {
-         tracing::error!(
-            "Peer ID must be 32 bytes exactly, got {} on line: {line}",
-            decoded_peer_id.len()
-         );
-         continue;
+      let is_valid_name = !name.is_empty()
+         && name.len() <= 15
+         // I had to type hint for some reason
+         && !name.contains(|c: char| c.is_whitespace() || !c.is_ascii_alphanumeric());
+      if !is_valid_name {
+         tracing::warn!("Invalid known peer name: {name}");
+         return None;
       }
-      return Some(PeerVerifier {
-         expected_peer_id: decoded_peer_id
-            .try_into()
-            .expect("Failed to convert to array"),
-         supported: rustls::crypto::CryptoProvider::get_default()
-            .expect("No default crypto provider installed")
-            .signature_verification_algorithms,
-      });
-   }
-   None
+      let Ok(decoded_peer_id) = decode_hex_peer_id(hex_peer_id) else {
+         tracing::warn!("Invalid known peer ID: {hex_peer_id}");
+         return None;
+      };
+      Some(decoded_peer_id)
+   })
 }
 #[instrument]
 pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
@@ -95,13 +90,11 @@ pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
    let path = crate::CONFIG_DIR.join("known_peers");
    assert!(path.exists(), "Known peers file does not exist");
 
-   if let Some(existing) = fetch_known_peer(peer_name.clone()) {
-      if existing.expected_peer_id != peer_id {
-         tracing::warn!("Peer {peer_name} already exists with a different ID, overwriting");
-      } else {
-         tracing::info!("Peer {peer_name} already exists with the same ID, skipping");
-         return;
-      }
+   if fetch_known_peer(&peer_name).is_some() {
+      tracing::warn!(
+         "Peer {peer_name} already known if you are trying to update the peer ID you will need to remove the old peer first"
+      );
+      return;
    }
 
    let peer_id = hex::encode(peer_id);
@@ -109,19 +102,20 @@ pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
       .append(true)
       .open(path)
       .expect("Failed to open known peers file");
+   if file.metadata().expect("Failed to get metadata").len() > 0 {
+      let mut last_char = [0];
+      file
+         .read_exact(&mut last_char)
+         .expect("Failed to read last character");
+      if last_char[0] != b'\n' {
+         file.write_all(b"\n").expect("Failed to write newline");
+      }
+   }
    writeln!(file, "{peer_name} {peer_id}").expect("Failed to write to known peers file");
 }
+#[derive(Debug)] //switched to derive Debug
 pub struct PeerVerifier {
-   expected_peer_id: [u8; 32],
    supported: WebPkiSupportedAlgorithms,
-}
-
-impl std::fmt::Debug for PeerVerifier {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      f.debug_struct("PeerVerifier")
-         .field("expected_peer_id", &hex::encode(self.expected_peer_id))
-         .finish()
-   }
 }
 
 impl ServerCertVerifier for PeerVerifier {
@@ -141,7 +135,7 @@ impl ServerCertVerifier for PeerVerifier {
    #[instrument(skip(end_entity, _intermediates, _ocsp_response))]
    fn verify_server_cert(
       &self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
-      _server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
+      server_name: &ServerName<'_>, _ocsp_response: &[u8], _now: UnixTime,
    ) -> Result<ServerCertVerified, rustls::Error> {
       // Parse certificate
       let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
@@ -152,8 +146,16 @@ impl ServerCertVerifier for PeerVerifier {
 
       // Hash it
       let peer_id = blake3::hash(public_key);
+      // substr the name to 15 characters (without cloning the string to avoid allocating)
 
-      if peer_id.as_bytes() != &self.expected_peer_id {
+      let full_name = server_name.to_str();
+      let max_name_length = 15.max(full_name.len());
+      let peer_name = &full_name[..max_name_length];
+
+      let Some(expected_peer_id) = fetch_known_peer(peer_name) else {
+         return Err(rustls::Error::General("Unknown peer".into()));
+      };
+      if *peer_id.as_bytes() != expected_peer_id {
          return Err(rustls::Error::General("Unknown peer".into()));
       }
 
@@ -209,7 +211,7 @@ mod tests {
 
       let result = fetch_known_peer("alice".into());
       assert!(result.is_some(), "should find alice");
-      assert_eq!(result.unwrap().expected_peer_id, peer_id);
+      assert_eq!(result.unwrap(), peer_id);
 
       assert!(fetch_known_peer("bob".into()).is_none());
 
@@ -230,7 +232,6 @@ mod tests {
       setup();
       let (cert_der, peer_id) = generate_test_cert();
       let verifier = PeerVerifier {
-         expected_peer_id: peer_id,
          supported: rustls::crypto::CryptoProvider::get_default()
             .unwrap()
             .signature_verification_algorithms,
@@ -246,7 +247,6 @@ mod tests {
       setup();
       let (cert_der, _) = generate_test_cert();
       let verifier = PeerVerifier {
-         expected_peer_id: [0xFF; 32],
          supported: rustls::crypto::CryptoProvider::get_default()
             .unwrap()
             .signature_verification_algorithms,
