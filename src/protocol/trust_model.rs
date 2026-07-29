@@ -3,6 +3,7 @@ use std::{
    io::{BufRead, BufReader, Read, Write},
 };
 
+use crate::CONFIG_DIR;
 use hex::FromHexError;
 use rustls::{
    client::danger::{ServerCertVerified, ServerCertVerifier},
@@ -10,7 +11,6 @@ use rustls::{
    pki_types::{CertificateDer, ServerName, UnixTime},
 };
 use tracing::instrument;
-
 fn decode_hex_peer_id(hex_peer_id: &str) -> Result<[u8; 32], hex::FromHexError> {
    let decoded_peer_id = hex::decode(hex_peer_id)?;
    if decoded_peer_id.len() != 32 {
@@ -47,7 +47,7 @@ pub fn fingerprint(public_key: &[u8]) -> String {
 
 #[instrument]
 pub fn fetch_known_peer(peer_name: &str) -> Option<[u8; 32]> {
-   let path = crate::CONFIG_DIR.join("known_peers");
+   let path = CONFIG_DIR.join("known_peers");
    assert!(path.exists(), "Known peers file does not exist");
    let file = BufReader::new(File::open(path).expect("Failed to open known peers file"));
    let buffered = BufReader::new(file);
@@ -87,7 +87,7 @@ pub fn add_known_peer(peer_name: String, peer_id: [u8; 32]) {
       "Peer name must not contain whitespace"
    );
 
-   let path = crate::CONFIG_DIR.join("known_peers");
+   let path = CONFIG_DIR.join("known_peers");
    assert!(path.exists(), "Known peers file does not exist");
 
    if fetch_known_peer(&peer_name).is_some() {
@@ -170,14 +170,14 @@ mod tests {
 
    fn setup() {
       let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-      let path = crate::CONFIG_DIR.join("known_peers");
+      let path = CONFIG_DIR.join("known_peers");
       if !path.exists() {
          fs::write(&path, "").expect("Failed to create test known_peers file");
       }
    }
 
    fn cleanup_known_peers() {
-      let path = crate::CONFIG_DIR.join("known_peers");
+      let path = CONFIG_DIR.join("known_peers");
       let _ = fs::remove_file(path);
    }
 
@@ -206,7 +206,7 @@ mod tests {
    fn test_add_and_fetch_round_trip() {
       setup();
       let peer_id = [0x42; 32];
-      fs::write(crate::CONFIG_DIR.join("known_peers"), "").unwrap();
+      fs::write(CONFIG_DIR.join("known_peers"), "").unwrap();
       add_known_peer("alice".into(), peer_id);
 
       let result = fetch_known_peer("alice".into());
@@ -217,7 +217,7 @@ mod tests {
 
       // Malformed lines are skipped, not panicked
       fs::write(
-         crate::CONFIG_DIR.join("known_peers"),
+         CONFIG_DIR.join("known_peers"),
          "bad line here\nvalid_peer 0000000000000000000000000000000000000000000000000000000000000000\n",
       )
       .unwrap();
