@@ -1,0 +1,246 @@
+use crate::CONFIG_DIR;
+use crate::protocol::error::Result;
+use quinn::{
+   ClientConfig, Endpoint, ServerConfig,
+   crypto::rustls::{QuicClientConfig, QuicServerConfig},
+};
+use rcgen::{CertificateParams, KeyPair};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::{fs, path::PathBuf, sync::Arc};
+
+const PROTOCOL_NAME: &str = concat!("fsync", env!("CARGO_PKG_VERSION"));
+
+fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
+   let dir = CONFIG_DIR.join("certs");
+   fs::create_dir_all(&dir)?;
+   Ok((
+      dir.join(format!("{name}.cert.der")),
+      dir.join(format!("{name}.key.der")),
+   ))
+}
+
+fn generate_self_signed_cert(
+   name: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+   let (cert_path, key_path) = cache_path(name)?;
+   if cert_path.exists() && key_path.exists() {
+      let cert_bytes = fs::read(&cert_path)?;
+      let key_bytes = fs::read(&key_path)?;
+      return Ok((
+         vec![CertificateDer::from(cert_bytes)],
+         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_bytes)),
+      ));
+   }
+
+   let mut params = CertificateParams::default();
+   params.subject_alt_names = vec![rcgen::SanType::DnsName(name.try_into()?)];
+
+   let key_pair = KeyPair::generate()?;
+   let cert = params.self_signed(&key_pair)?;
+
+   let cert_der = CertificateDer::from(cert.der().to_vec());
+   let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+
+   fs::write(&cert_path, cert_der.as_ref())?;
+   fs::write(&key_path, key_pair.serialize_der())?;
+
+   Ok((vec![cert_der], key_der))
+}
+
+pub fn configure_server(name: &str) -> Result<ServerConfig> {
+   let (cert_chain, private_key) = generate_self_signed_cert(name)?;
+
+   let client_verifier =
+      rustls::server::WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore::empty()))
+         .allow_unauthenticated()
+         .build()
+         .expect("Built with allow_unauthenticated; this is infallible");
+
+   let mut server_crypto = rustls::ServerConfig::builder()
+      .with_client_cert_verifier(client_verifier)
+      .with_single_cert(cert_chain, private_key)
+      .expect("Cert and key were generated together; this is infallible");
+
+   server_crypto.alpn_protocols = vec![PROTOCOL_NAME.as_bytes().to_vec()];
+
+   Ok(ServerConfig::with_crypto(Arc::new(
+      QuicServerConfig::try_from(server_crypto)
+         .expect("Server crypto config is valid; this is infallible"),
+   )))
+}
+
+pub fn configure_client(name: &str) -> Result<ClientConfig> {
+   let (cert_chain, private_key) = generate_self_signed_cert(name)?;
+
+   #[derive(Debug)]
+   struct DangerNoVerifier;
+   impl rustls::client::danger::ServerCertVerifier for DangerNoVerifier {
+      fn verify_server_cert(
+         &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
+         _server_name: &rustls::pki_types::ServerName<'_>, _ocsp_response: &[u8],
+         _now: rustls::pki_types::UnixTime,
+      ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+         Ok(rustls::client::danger::ServerCertVerified::assertion())
+      }
+      fn verify_tls12_signature(
+         &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &rustls::DigitallySignedStruct,
+      ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+      {
+         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+      }
+      fn verify_tls13_signature(
+         &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &rustls::DigitallySignedStruct,
+      ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+      {
+         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+      }
+      fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+         vec![
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+         ]
+      }
+   }
+
+   let mut client_crypto = rustls::ClientConfig::builder()
+      .dangerous()
+      .with_custom_certificate_verifier(Arc::new(DangerNoVerifier))
+      .with_client_auth_cert(cert_chain, private_key)
+      .expect("Cert and key were generated together; this is infallible");
+
+   client_crypto.alpn_protocols = vec![PROTOCOL_NAME.as_bytes().to_vec()];
+
+   Ok(ClientConfig::new(Arc::new(
+      QuicClientConfig::try_from(client_crypto)
+         .expect("Client crypto config is valid; this is infallible"),
+   )))
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use std::fs;
+
+   fn clear_certs(name: &str) {
+      let Ok((cert_path, key_path)) = cache_path(name) else {
+         return;
+      };
+      let _ = fs::remove_file(&cert_path);
+      let _ = fs::remove_file(&key_path);
+   }
+
+   #[test]
+   fn test_cache_path() {
+      let (cert_path, key_path) = cache_path("test-node").expect("Failed to get cache path");
+      let dir = CONFIG_DIR.join("certs");
+      assert_eq!(cert_path, dir.join("test-node.cert.der"));
+      assert_eq!(key_path, dir.join("test-node.key.der"));
+   }
+
+   #[test]
+   fn test_generate_caches_files() {
+      let name = "test-cache-files";
+      clear_certs(name);
+      let (cert_path, _) = cache_path(name).expect("Failed to get cache path");
+      assert!(
+         !cert_path.exists(),
+         "cache should not exist before generation"
+      );
+
+      generate_self_signed_cert(name).expect("Failed to generate cert");
+      assert!(
+         cert_path.exists(),
+         "cert file should exist after generation"
+      );
+   }
+
+   #[test]
+   fn test_cache_preserves_identity() {
+      let name = "test-cache-identity";
+      clear_certs(name);
+
+      let (certs_a, key_a) = generate_self_signed_cert(name).expect("Failed to generate cert");
+      let (certs_b, key_b) = generate_self_signed_cert(name).expect("Failed to generate cert");
+
+      assert_eq!(
+         certs_a[0].as_ref(),
+         certs_b[0].as_ref(),
+         "cached cert must match"
+      );
+      match (&key_a, &key_b) {
+         (PrivateKeyDer::Pkcs8(a), PrivateKeyDer::Pkcs8(b)) => assert_eq!(
+            a.secret_pkcs8_der(),
+            b.secret_pkcs8_der(),
+            "cached key must match"
+         ),
+         _ => panic!("unexpected key format"),
+      }
+   }
+
+   #[test]
+   fn test_different_names_different_certs() {
+      clear_certs("test-diff-a");
+      clear_certs("test-diff-b");
+
+      let (certs_a, _) = generate_self_signed_cert("test-diff-a").expect("Failed to generate cert");
+      let (certs_b, _) = generate_self_signed_cert("test-diff-b").expect("Failed to generate cert");
+
+      assert_ne!(
+         certs_a[0].as_ref(),
+         certs_b[0].as_ref(),
+         "different nodes must have different certs"
+      );
+   }
+
+   #[test]
+   fn test_cache_survives_multiple_calls() {
+      let name = "test-cache-multi";
+      clear_certs(name);
+
+      let (certs_first, _) = generate_self_signed_cert(name).expect("Failed to generate cert");
+      let (cert_path, _) = cache_path(name).expect("Failed to get cache path");
+      fs::remove_file(&cert_path).expect("Failed to remove cache file");
+
+      let (certs_second, _) = generate_self_signed_cert(name).expect("Failed to generate cert");
+      assert_ne!(
+         certs_first[0].as_ref(),
+         certs_second[0].as_ref(),
+         "removing the cache should produce a new cert"
+      );
+   }
+
+   #[test]
+   fn test_cache_not_recreated_on_subsequent_calls() {
+      let name = "test-no-recreate";
+      clear_certs(name);
+
+      let (cert_path, key_path) = cache_path(name).expect("Failed to get cache path");
+      generate_self_signed_cert(name).expect("Failed to generate cert");
+      let cert_modified = fs::metadata(&cert_path)
+         .expect("Failed to read metadata")
+         .modified()
+         .expect("Failed to read modified time");
+      let key_modified = fs::metadata(&key_path)
+         .expect("Failed to read metadata")
+         .modified()
+         .expect("Failed to read modified time");
+
+      generate_self_signed_cert(name).expect("Failed to generate cert");
+      assert_eq!(
+         fs::metadata(&cert_path)
+            .expect("Failed to read metadata")
+            .modified()
+            .expect("Failed to read modified time"),
+         cert_modified,
+         "cache should not be recreated on second call"
+      );
+      assert_eq!(
+         fs::metadata(&key_path)
+            .expect("Failed to read metadata")
+            .modified()
+            .expect("Failed to read modified time"),
+         key_modified,
+         "cache should not be recreated on second call"
+      );
+   }
+}
