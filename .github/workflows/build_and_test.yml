@@ -22,6 +22,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          rustflags: '' # Prevents extraneous warnings and extra flags on CI (this is not necessarly a good idea or permanent so please don't always expect warnings to be ignored)
       - name: Cache Cargo dependencies
         uses: actions/cache@v4
         with:
