@@ -37,4 +37,5 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
+        timeout-minutes: 5 # if tests take longer than 5 minutes, they are likely to be hung so fail the build
         run: cargo test
