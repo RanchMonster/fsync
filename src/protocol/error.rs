@@ -19,18 +19,6 @@ pub enum Error {
    #[error("Parse data error: {0}")]
    ParseData(String),
 }
-impl Error {
-   pub const fn close_code(&self) -> Option<CloseCode> {
-      match self {
-         Error::PeerRejected(_) => Some(CloseCode::AuthenticationFailure),
-         Error::Io(_) => Some(CloseCode::InternalError),
-         Error::Quic(_) => Some(CloseCode::InternalError),
-         Error::Rcgen(_) => Some(CloseCode::InternalError),
-         Error::ParseData(_) => Some(CloseCode::InternalError),
-         _ => None,
-      }
-   }
-}
 impl From<ReadError> for Error {
    fn from(err: quinn::ReadError) -> Self {
       Error::Quic(err.to_string())
