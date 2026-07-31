@@ -14,14 +14,14 @@ pub enum Error {
    /// Peer not found
    #[error("Peer not found")]
    PeerNotFound,
-   /// Rejected by a fellow peer
-   #[error("Rejected by a fellow peer")]
-   PeerRejected,
+   /// Peer was rejected due to a reason
+   #[error("Peer was rejected due to {}", .0)]
+   PeerRejected(String),
    /// Malformed peer
    #[error("Invalid peer information")]
    InvalidPeer(mdns_sd::ResolvedService),
-   /// Network error
-   #[error("Network error")]
+   /// Io error
+   #[error("IO error")]
    Io(#[from] std::io::Error),
    #[error("QUIC error")]
    Quic(#[from] quinn::ConnectionError),
