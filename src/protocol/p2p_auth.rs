@@ -1,46 +1,45 @@
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
-use quinn::{
-   Connection, ConnectionError, ConnectionId, Incoming, Side, VarInt, crypto::rustls::HandshakeData,
-};
+use quinn::{Connection, Incoming, Side};
 use rand::random;
 use std::{
-   collections::{HashMap, HashSet},
    fmt::Display,
-   io::{BufRead, BufReader},
+   fs::File,
+   io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
    str::FromStr,
-   sync::{Arc, LazyLock},
-   time::{Duration, SystemTime},
+   sync::Arc,
+   time::Duration,
 };
-use tokio::{sync::RwLock, time::timeout};
+use tokio::{task, time::timeout};
 mod mtls;
 use super::error::*;
-use crate::{CONFIG_DIR, protocol::PROTOCOL_NAME};
+use crate::CONFIG_DIR;
 pub use mtls::configure_server;
-use tokio::task;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// A macro to read a datagram from a connection with a timeout
 macro_rules! datagram {
    ($connection:expr) => {
       match timeout(DEFAULT_TIMEOUT, $connection.read_datagram()).await {
          Ok(Ok(datagram)) => Ok(Some(datagram)),
-         Ok(Err(err)) => Err(err.into()),
+         Ok(Err(err)) => Err(Error::from(err)),
          Err(_) => Ok(None),
       }
    };
    ($connection:expr, $timeout:expr) => {
       match timeout($timeout, $connection.read_datagram()).await {
          Ok(Ok(datagram)) => Ok(Some(datagram)),
-         Ok(Err(err)) => Err(err.into()),
+         Ok(Err(err)) => Err(Error::from(err)),
          Err(_) => Ok(None),
       }
    };
 }
+
 fn get_pair_mode() -> PairMode {
    #[cfg(not(debug_assertions))]
-   todo!("implement get_pair_mode");
+   todo!("implement a config on another branch");
    #[cfg(debug_assertions)]
    PairMode::Relaxed
 }
+
 // I hate handling it like this but rust won't let me do it with a Enum
 struct AuthCommands;
 impl AuthCommands {
@@ -51,53 +50,38 @@ impl AuthCommands {
    const ACCEPT: &[u8] = b"ACCEPT";
    const PAIR: &[u8] = b"PAIR";
 }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct KnownPeer([u8; 32]);
 
-struct KnownPeer {
-   name: String,
-   key_hash: [u8; 32],
-   // store more info here as needed
-}
 impl FromStr for KnownPeer {
    type Err = Error;
-   fn from_str(s: &str) -> Result<Self> {
-      let mut fields = s.split_whitespace();
-      let name = fields
-         .next()
-         .ok_or(Error::ParseData("Missing name".into()))?;
-      let key_hash = fields
-         .next()
-         .map(|key_hash| {
-            hex::decode(key_hash).map_err(|_| Error::ParseData("Invalid key hash".into()))
-         })
-         .ok_or(Error::ParseData("Missing key hash".into()))??
+   fn from_str(line: &str) -> Result<Self> {
+      let key_hash = hex::decode(line)
+         .map_err(|_| Error::ParseData("Invalid key hash".into()))?
          .try_into()
          .map_err(|_| Error::ParseData("Invalid key hash length".into()))?;
-      Ok(KnownPeer {
-         name: name.into(),
-         key_hash,
-      })
+      Ok(KnownPeer(key_hash))
    }
 }
-fn is_known_peers(key_hash: &[u8; 32]) -> Result<Option<KnownPeer>> {
+fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
+   use std::io::ErrorKind;
    let path = CONFIG_DIR.join("known_peers");
-   BufReader::new(std::fs::File::open(path)?)
-      .lines()
-      .find_map(|line| {
-         let result = line.map(|line| KnownPeer::from_str(&line));
-         match result {
-            Ok(Ok(peer)) if peer.key_hash == *key_hash => Some(peer),
-            Ok(Ok(_)) => None, // ignore lines that don't match the key hash
-            Ok(Err(err)) => {
-               tracing::error!("Failed to parse known peer: {err}");
-               None
-            }
-            Err(err) => {
-               tracing::error!("Failed to read line from known peers file: {err}");
-               None
-            }
-         }
-      });
-   todo!("implement is_known_peers");
+   let file = match std::fs::File::open(&path) {
+      Ok(file) => file,
+      Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+      Err(err) => return Err(err.into()),
+   };
+   for line in BufReader::new(file).lines() {
+      let line = line?;
+      if line.is_empty() {
+         continue;
+      }
+      let peer = KnownPeer::from_str(&line)?;
+      if peer.0 == *key_hash {
+         return Ok(true);
+      }
+   }
+   Ok(false)
 }
 /// Represents the pairing mode of this device
 #[derive(Debug)]
@@ -128,55 +112,172 @@ impl Default for PairMode {
       Self::Relaxed
    }
 }
-fn add_known_peer(peer: KnownPeer) {
-   todo!("implement add_known_peer");
+fn add_known_peer(peer: KnownPeer) -> Result<()> {
+   if is_known_peers(&peer.0)? {
+      return Ok(());
+   }
+   let mut file = File::options()
+      .read(true)
+      .append(true)
+      .create(true)
+      .open(CONFIG_DIR.join("known_peers"))?;
+   if file.metadata()?.len() > 0 {
+      file.seek(SeekFrom::End(-1))?;
+      let mut last_char = [0];
+      file.read_exact(&mut last_char)?;
+      if last_char[0] != b'\n' {
+         file.write_all(b"\n")?;
+      }
+   }
+   file.write_all(hex::encode(peer.0).as_bytes())?;
+   file.write_all(b"\n")?;
+   Ok(())
 }
-/// This function is used for authenticating peers who claim to be known to us already
-async fn authenticate_peer(connection: &mut Connection) -> Result<KnownPeer> {
+/// Extracts the key hash of the peer's certificate, used to identify a peer in the known peers list
+fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
    use Error::PeerRejected;
-   let boexed_data = connection
+   let identity = connection
       .peer_identity()
-      .ok_or(PeerRejected("no peer identity".to_string()))?;
-   let peer_cert = boexed_data
+      .ok_or_else(|| PeerRejected("no peer identity".to_string()))?;
+   let peer_cert = identity
       .downcast_ref::<rustls::pki_types::CertificateDer>()
-      .ok_or(PeerRejected(
-         "peer identity is not a valid certificate".to_string(),
-      ))?;
+      .ok_or_else(|| PeerRejected("peer identity is not a valid certificate".to_string()))?;
    let (_, x509_cert) = x509_parser::parse_x509_certificate(peer_cert)
       .map_err(|_| PeerRejected("peer identity is not a valid certificate".to_string()))?;
    let public_key = x509_cert.public_key().raw;
-   let peer_id = blake3::hash(public_key);
-   match task::spawn_blocking(move || is_known_peers(peer_id.as_bytes()))
+   Ok(*blake3::hash(public_key).as_bytes())
+}
+/// This function is used for authenticating peers who claim to be known to us already
+async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
+   use Error::PeerRejected;
+   let peer_id = peer_key_hash(connection)?;
+   let is_known = task::spawn_blocking(move || is_known_peers(&peer_id))
       .await
-      .expect("Failed to spawn task")?
-   {
-      Some(peer) => Ok(peer),
-      None => Err(PeerRejected("peer is not a known peer".to_string())),
+      .map_err(|err| PeerRejected(format!("failed to check known peers: {err}")))??;
+   if !is_known {
+      return Err(PeerRejected("peer is not a known peer".to_string()));
+   }
+   Ok(())
+}
+
+/// Reads exactly `buf.len()` bytes from a stream, erroring if the stream closes early
+async fn read_exact(stream: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
+   use Error::PeerRejected;
+   let mut offset = 0;
+   while offset < buf.len() {
+      let read = stream
+         .read(&mut buf[offset..])
+         .await?
+         .ok_or_else(|| PeerRejected("stream closed during read".to_string()))?;
+      offset += read;
+   }
+   Ok(())
+}
+/// Reads the next auth command from a stream, accumulating bytes until a known command matches
+async fn read_command(stream: &mut quinn::RecvStream) -> Result<Vec<u8>> {
+   let commands = [
+      AuthCommands::INIT,
+      AuthCommands::AKNOWLEDGE,
+      AuthCommands::HOLD,
+      AuthCommands::REJECT,
+      AuthCommands::ACCEPT,
+      AuthCommands::PAIR,
+   ];
+   let mut buf = Vec::new();
+   loop {
+      if let Some(command) = commands.iter().find(|command| buf.starts_with(command)) {
+         return Ok((*command).to_vec());
+      }
+      if buf.len() > 32 {
+         return Err(Error::ParseData("unexpected pairing response".into()));
+      }
+      let mut chunk = [0; 16];
+      let read = stream
+         .read(&mut chunk)
+         .await?
+         .ok_or_else(|| Error::PeerRejected("stream closed while awaiting response".to_string()))?;
+      buf.extend_from_slice(&chunk[..read]);
+   }
+}
+/// Prompts the user for input on stdin
+fn prompt(prompt: &str) -> Result<String> {
+   use std::io::{stdin, stdout};
+   let mut stdout = stdout();
+   stdout.write_all(prompt.as_bytes())?;
+   stdout.flush()?;
+   let mut line = String::new();
+   stdin().read_line(&mut line)?;
+   Ok(line.trim().to_string())
+}
+
+async fn pair_client_side(connection: &mut Connection) -> Result<()> {
+   use Error::PeerRejected;
+   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+   let mut mode_len = [0; 1];
+   read_exact(&mut channel_rx, &mut mode_len).await?;
+   let mut mode_buf = vec![0; mode_len[0] as usize];
+   read_exact(&mut channel_rx, &mut mode_buf).await?;
+   let mode_str = std::str::from_utf8(&mode_buf)
+      .map_err(|_| Error::ParseData("pair mode is not valid utf-8".into()))?;
+   match mode_str {
+      "RELAXED" => {}
+      "PASSWORD" => {
+         let password = task::spawn_blocking(|| prompt("Password: "))
+            .await
+            .map_err(|err| PeerRejected(format!("failed to read password: {err}")))??;
+         if password.is_empty() {
+            return Err(PeerRejected("password must not be empty".to_string()));
+         }
+         if password.len() > 256 {
+            return Err(PeerRejected("password is too long".to_string()));
+         }
+         channel_tx.write_all(password.as_bytes()).await?;
+      }
+      "STRICT" => {
+         let key_hex = task::spawn_blocking(|| prompt("Enter the pairing key: "))
+            .await
+            .map_err(|err| PeerRejected(format!("failed to read pairing key: {err}")))??;
+         let key_hex: String = key_hex.chars().filter(|c| *c != '-').collect();
+         let key =
+            hex::decode(key_hex).map_err(|_| Error::ParseData("invalid pairing key".into()))?;
+         let key: [u8; 8] = key
+            .try_into()
+            .map_err(|_| Error::ParseData("invalid pairing key".into()))?;
+         channel_tx.write_all(&key).await?;
+      }
+      "KEYONLY" => {}
+      other => return Err(Error::ParseData(format!("unknown pair mode: {other}"))),
+   }
+   let response = read_command(&mut channel_rx).await?;
+   if response.as_slice() == AuthCommands::ACCEPT {
+      let peer_id = peer_key_hash(connection)?;
+      task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
+         .await
+         .map_err(|err| PeerRejected(format!("failed to register peer: {err}")))??;
+      Ok(())
+   } else if response.as_slice() == AuthCommands::REJECT {
+      Err(PeerRejected("pairing rejected by peer".to_string()))
+   } else {
+      Err(Error::ParseData(format!(
+         "unexpected pairing response: {}",
+         String::from_utf8_lossy(&response)
+      )))
    }
 }
 
-async fn pair_client_side(connection: &mut Connection) -> Result<KnownPeer> {
-   use CloseCode::AuthenticationFailure;
-   use Error::PeerRejected;
-   use PairMode::*;
-   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
-   todo!("implement pair_client_side");
-}
-async fn pair_server_side(connection: &mut Connection) -> Result<KnownPeer> {
-   use CloseCode::AuthenticationFailure;
+async fn pair_server_side(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    use PairMode::*;
    let pair_mode = get_pair_mode();
    let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   let mode = pair_mode.to_string();
    assert!(
-      pair_mode
-         .to_string()
-         .contains(|c: char| c.is_ascii_uppercase()),
+      mode.contains(|c: char| c.is_ascii_uppercase()),
       "Pair mode must be in uppercase"
    );
-   channel_tx
-      .write_all(pair_mode.to_string().as_bytes())
-      .await?;
+   let mode_len = u8::try_from(mode.len()).expect("pair mode string is too long");
+   channel_tx.write_all(&[mode_len]).await?;
+   channel_tx.write_all(mode.as_bytes()).await?;
    match pair_mode {
       Relaxed => {
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
@@ -206,7 +307,7 @@ async fn pair_server_side(connection: &mut Connection) -> Result<KnownPeer> {
                .is_ok()
          })
          .await
-         .expect("Failed to spawn task");
+         .map_err(|err| PeerRejected(format!("failed to verify password: {err}")))?;
          if !accept {
             channel_tx.write_all(AuthCommands::REJECT).await?;
             return Err(PeerRejected("Password rejected".to_string()));
@@ -222,24 +323,49 @@ async fn pair_server_side(connection: &mut Connection) -> Result<KnownPeer> {
             "Generated key must be 23 characters long when encoded with dashes"
          );
          let mut response_key = [0; 8];
-         channel_rx.read(&mut response_key).await?;
+         read_exact(&mut channel_rx, &mut response_key).await?;
          if random_key != response_key {
+            channel_tx.write_all(AuthCommands::REJECT).await?;
             return Err(PeerRejected("Key mismatch".to_string()));
          }
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
       }
    }
-   todo!("implement pair_server_side")
+   let peer_id = peer_key_hash(connection)?;
+   task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
+      .await
+      .map_err(|err| PeerRejected(format!("failed to register peer: {err}")))??;
+   Ok(())
 }
 
-pub async fn pair_peer(connection: &mut Connection) -> Result<KnownPeer> {
+pub async fn pair_peer(connection: &mut Connection) -> Result<()> {
    use Side::{Client, Server};
    match connection.side() {
       Client => pair_client_side(connection).await,
       Server => pair_server_side(connection).await,
    }
 }
-pub async fn handle_incoming(incoming: Incoming) -> Result<(Connection, KnownPeer)> {
+/// Client side of the authenticated handshake: announces we are a known peer and verifies the server
+pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()> {
+   use Error::PeerRejected;
+   connection
+      .send_datagram(AuthCommands::INIT.into())
+      .map_err(Error::from)?;
+   authenticate_peer(connection).await?;
+   match datagram!(connection)? {
+      Some(data) if data.starts_with(AuthCommands::AKNOWLEDGE) => Ok(()),
+      Some(_) => Err(PeerRejected("unexpected response from server".to_string())),
+      None => Err(PeerRejected("authentication timed out".to_string())),
+   }
+}
+/// Client side of the pairing handshake: announces a pairing request and runs the exchange
+pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
+   connection
+      .send_datagram(AuthCommands::PAIR.into())
+      .map_err(Error::from)?;
+   pair_peer(connection).await
+}
+pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    use CloseCode::AuthenticationFailure;
    use Error::PeerRejected;
    let mut connection = incoming.await?;
@@ -255,7 +381,12 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<(Connection, KnownPee
    };
    if handshake_packet.starts_with(AuthCommands::INIT) {
       match authenticate_peer(&mut connection).await {
-         Ok(peer) => Ok((connection, peer)),
+         Ok(_) => {
+            connection
+               .send_datagram(AuthCommands::AKNOWLEDGE.into())
+               .map_err(Error::from)?;
+            Ok(connection)
+         }
          Err(PeerRejected(reason)) => {
             connection.close(AuthenticationFailure.into(), reason.as_bytes());
             Err(PeerRejected(reason))
@@ -267,7 +398,7 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<(Connection, KnownPee
       }
    } else if handshake_packet.starts_with(AuthCommands::PAIR) {
       match pair_peer(&mut connection).await {
-         Ok(peer) => Ok((connection, peer)),
+         Ok(_) => Ok(connection),
          Err(PeerRejected(reason)) => {
             connection.close(AuthenticationFailure.into(), reason.as_bytes());
             Err(PeerRejected(reason))
