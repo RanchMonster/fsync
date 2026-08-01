@@ -1,20 +1,46 @@
+use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
 use quinn::{
-   Connection, ConnectionError, ConnectionId, Incoming, VarInt, crypto::rustls::HandshakeData,
+   Connection, ConnectionError, ConnectionId, Incoming, Side, VarInt, crypto::rustls::HandshakeData,
 };
+use rand::random;
 use std::{
    collections::{HashMap, HashSet},
+   fmt::Display,
    io::{BufRead, BufReader},
    str::FromStr,
    sync::{Arc, LazyLock},
-   time::SystemTime,
+   time::{Duration, SystemTime},
 };
-use tokio::sync::RwLock;
+use tokio::{sync::RwLock, time::timeout};
 mod mtls;
 use super::error::*;
 use crate::{CONFIG_DIR, protocol::PROTOCOL_NAME};
 pub use mtls::configure_server;
 use tokio::task;
-
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A macro to read a datagram from a connection with a timeout
+macro_rules! datagram {
+   ($connection:expr) => {
+      match timeout(DEFAULT_TIMEOUT, $connection.read_datagram()).await {
+         Ok(Ok(datagram)) => Ok(Some(datagram)),
+         Ok(Err(err)) => Err(err.into()),
+         Err(_) => Ok(None),
+      }
+   };
+   ($connection:expr, $timeout:expr) => {
+      match timeout($timeout, $connection.read_datagram()).await {
+         Ok(Ok(datagram)) => Ok(Some(datagram)),
+         Ok(Err(err)) => Err(err.into()),
+         Err(_) => Ok(None),
+      }
+   };
+}
+fn get_pair_mode() -> PairMode {
+   #[cfg(not(debug_assertions))]
+   todo!("implement get_pair_mode");
+   #[cfg(debug_assertions)]
+   PairMode::Relaxed
+}
 // I hate handling it like this but rust won't let me do it with a Enum
 struct AuthCommands;
 impl AuthCommands {
@@ -73,6 +99,38 @@ fn is_known_peers(key_hash: &[u8; 32]) -> Result<Option<KnownPeer>> {
       });
    todo!("implement is_known_peers");
 }
+/// Represents the pairing mode of this device
+#[derive(Debug)]
+pub enum PairMode {
+   /// Strict creates a random key that must be entered by the other device
+   Strict,
+   /// Relaxed allows other devices to connect without any confirmation from this device
+   Relaxed,
+   /// Password allows other devices to connect to this device with a password
+   Password(Arc<PasswordHashString>),
+   /// KeyOnly requires users to manually copy the public key to both devices
+   KeyOnly,
+   // Add other modes here as needed
+}
+impl Display for PairMode {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      match self {
+         PairMode::Strict => write!(f, "STRICT"),
+         PairMode::Relaxed => write!(f, "RELAXED"),
+         PairMode::Password(_) => write!(f, "PASSWORD"),
+         PairMode::KeyOnly => write!(f, "KEYONLY"),
+      }
+   }
+}
+impl Default for PairMode {
+   fn default() -> Self {
+      // for now, we default to relaxed mode
+      Self::Relaxed
+   }
+}
+fn add_known_peer(peer: KnownPeer) {
+   todo!("implement add_known_peer");
+}
 /// This function is used for authenticating peers who claim to be known to us already
 async fn authenticate_peer(connection: &mut Connection) -> Result<KnownPeer> {
    use Error::PeerRejected;
@@ -96,20 +154,105 @@ async fn authenticate_peer(connection: &mut Connection) -> Result<KnownPeer> {
       None => Err(PeerRejected("peer is not a known peer".to_string())),
    }
 }
-async fn pair_peer(connection: &mut Connection) -> Result<KnownPeer> {
-   todo!("implement pair_peer");
+
+async fn pair_client_side(connection: &mut Connection) -> Result<KnownPeer> {
+   use CloseCode::AuthenticationFailure;
+   use Error::PeerRejected;
+   use PairMode::*;
+   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+   todo!("implement pair_client_side");
+}
+async fn pair_server_side(connection: &mut Connection) -> Result<KnownPeer> {
+   use CloseCode::AuthenticationFailure;
+   use Error::PeerRejected;
+   use PairMode::*;
+   let pair_mode = get_pair_mode();
+   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   assert!(
+      pair_mode
+         .to_string()
+         .contains(|c: char| c.is_ascii_uppercase()),
+      "Pair mode must be in uppercase"
+   );
+   channel_tx
+      .write_all(pair_mode.to_string().as_bytes())
+      .await?;
+   match pair_mode {
+      Relaxed => {
+         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+      }
+      KeyOnly => {
+         channel_tx.write_all(AuthCommands::REJECT).await?;
+         return Err(PeerRejected(
+            "Key only mode does not allow pairing".to_string(),
+         ));
+      }
+      Password(password) => {
+         let password = password.clone();
+         let mut client_password = [0; 256]; // any password longer than this is rejected
+         let read = channel_rx
+            .read(&mut client_password)
+            .await?
+            .unwrap_or_default();
+         if read == 0 {
+            return Err(PeerRejected(
+               "Password must be at least 1 character long".to_string(),
+            ));
+         }
+         let verifier = Argon2::default();
+         let accept = task::spawn_blocking(move || {
+            verifier
+               .verify_password(&client_password, &password.password_hash())
+               .is_ok()
+         })
+         .await
+         .expect("Failed to spawn task");
+         if !accept {
+            channel_tx.write_all(AuthCommands::REJECT).await?;
+            return Err(PeerRejected("Password rejected".to_string()));
+         }
+         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+      }
+      Strict => {
+         let random_key = random::<[u8; 8]>();
+         let as_hex_string = random_key.map(|byte| format!("{byte:02X}")).join("-");
+         tracing::info!("Generated random key for device: {as_hex_string}");
+         assert!(
+            as_hex_string.len() == 23,
+            "Generated key must be 23 characters long when encoded with dashes"
+         );
+         let mut response_key = [0; 8];
+         channel_rx.read(&mut response_key).await?;
+         if random_key != response_key {
+            return Err(PeerRejected("Key mismatch".to_string()));
+         }
+         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+      }
+   }
+   todo!("implement pair_server_side")
+}
+
+pub async fn pair_peer(connection: &mut Connection) -> Result<KnownPeer> {
+   use Side::{Client, Server};
+   match connection.side() {
+      Client => pair_client_side(connection).await,
+      Server => pair_server_side(connection).await,
+   }
 }
 pub async fn handle_incoming(incoming: Incoming) -> Result<(Connection, KnownPeer)> {
    use CloseCode::AuthenticationFailure;
    use Error::PeerRejected;
    let mut connection = incoming.await?;
-   let handshake_packet = connection.read_datagram().await?;
-   if handshake_packet.is_empty() {
-      connection.close(AuthenticationFailure.into(), b"no auth handshake data");
-      return Err(PeerRejected(
-         "peer did not send auth handshake data".to_string(),
-      ));
-   }
+   let handshake_packet = match timeout(Duration::from_secs(5), connection.read_datagram()).await {
+      Ok(Ok(data)) => data,
+      Ok(Err(err)) => {
+         return Err(err.into());
+      }
+      Err(_) => {
+         connection.close(AuthenticationFailure.into(), b"handshake timed out");
+         return Err(PeerRejected("handshake timed out".to_string()));
+      }
+   };
    if handshake_packet.starts_with(AuthCommands::INIT) {
       match authenticate_peer(&mut connection).await {
          Ok(peer) => Ok((connection, peer)),
