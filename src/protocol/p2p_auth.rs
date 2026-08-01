@@ -10,6 +10,7 @@ use std::{
    time::Duration,
 };
 use tokio::{task, time::timeout};
+use x509_parser::nom::AsBytes;
 mod mtls;
 use super::error::*;
 use crate::CONFIG_DIR;
@@ -143,9 +144,12 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
    let identity = connection
       .peer_identity()
       .ok_or_else(|| PeerRejected("no peer identity".to_string()))?;
-   let peer_cert = identity
-      .downcast_ref::<rustls::pki_types::CertificateDer>()
-      .ok_or_else(|| PeerRejected("peer identity is not a valid certificate".to_string()))?;
+   let tls_handshake_data = identity
+      .downcast_ref::<Vec<rustls::pki_types::CertificateDer>>()
+      .ok_or_else(|| PeerRejected("peer identity is not a valid certificate(s)".to_string()))?;
+   let peer_cert = tls_handshake_data
+      .first()
+      .ok_or_else(|| PeerRejected("peer identity is not a valid certificate(s)".to_string()))?;
    let (_, x509_cert) = x509_parser::parse_x509_certificate(peer_cert)
       .map_err(|_| PeerRejected("peer identity is not a valid certificate".to_string()))?;
    let public_key = x509_cert.public_key().raw;
@@ -415,5 +419,62 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    } else {
       connection.close(AuthenticationFailure.into(), b"invalid auth handshake data");
       Err(PeerRejected("invalid auth handshake data".to_string()))
+   }
+}
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use quinn::{Connecting, Incoming};
+   use tokio::task::JoinSet;
+   const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
+   #[test]
+   fn test_known_peer_comparison() {
+      let random_key = random::<[u8; 32]>();
+      let peer = KnownPeer(random_key);
+      let hexed_key = hex::encode(random_key);
+      let prased_key = KnownPeer::from_str(&hexed_key).expect("failed to parse known peer");
+      assert_eq!(peer, prased_key);
+   }
+   async fn connecting_peer(connect_attempt: Connecting) {
+      let mut connection = connect_attempt.await.expect("failed to connect");
+      // send pairing request
+      connection
+         .send_datagram(AuthCommands::PAIR.into())
+         .expect("failed to send pairing request");
+      pair_peer(&mut connection)
+         .await
+         .expect("failed to pair peer");
+   }
+   async fn responding_peer(incoming: Incoming) {
+      handle_incoming(incoming)
+         .await
+         .expect("failed to handle incoming connection");
+   }
+   #[tokio::test]
+   async fn test_good_known_peer_auth() {
+      use quinn::Endpoint;
+      // gernerate key and cert for virtual peers
+      let server_config =
+         mtls::configure_server("test-peer-server").expect("failed to configure server crypto");
+      let client_config =
+         mtls::configure_client("test-peer-client").expect("failed to configure client crypto");
+      // initialize the quic server
+      let server = Endpoint::server(
+         server_config,
+         TEST_SOCKET_ADDR.parse().expect("invalid socket addr"),
+      )
+      .expect("failed to create server endpoint");
+
+      // reuse the same endpoint to connect to the host peer
+      let local_addr = server.local_addr().expect("failed to get local addr");
+      let connection = server
+         .connect_with(client_config, local_addr, "test-peer-server")
+         .expect("failed to connect to server");
+      let mut task_set = JoinSet::new();
+      task_set.spawn(connecting_peer(connection));
+      task_set.spawn(responding_peer(
+         server.accept().await.expect("failed to accept connection"),
+      ));
+      task_set.join_all().await;
    }
 }
