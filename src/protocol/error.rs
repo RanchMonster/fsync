@@ -1,4 +1,4 @@
-use quinn::{ConnectionError, ReadError, VarInt, WriteError};
+use quinn::{ConnectionError, ReadError, SendDatagramError, VarInt, WriteError};
 use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum Error {
@@ -13,7 +13,7 @@ pub enum Error {
    #[error("IO error")]
    Io(#[from] std::io::Error),
    #[error("QUIC error {0}")]
-   Quic(String),
+   Quic(Box<dyn std::error::Error + Send + Sync>),
    #[error("Certificate error: {0}")]
    Rcgen(#[from] rcgen::Error),
    #[error("Parse data error: {0}")]
@@ -21,17 +21,22 @@ pub enum Error {
 }
 impl From<ReadError> for Error {
    fn from(err: quinn::ReadError) -> Self {
-      Error::Quic(err.to_string())
+      Error::Quic(err.into())
    }
 }
 impl From<WriteError> for Error {
    fn from(err: quinn::WriteError) -> Self {
-      Error::Quic(err.to_string())
+      Error::Quic(err.into())
    }
 }
 impl From<ConnectionError> for Error {
    fn from(err: ConnectionError) -> Self {
-      Error::Quic(err.to_string())
+      Error::Quic(err.into())
+   }
+}
+impl From<SendDatagramError> for Error {
+   fn from(err: SendDatagramError) -> Self {
+      Error::Quic(err.into())
    }
 }
 #[repr(u32)]
