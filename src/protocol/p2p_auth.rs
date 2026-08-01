@@ -63,6 +63,11 @@ impl FromStr for KnownPeer {
       Ok(KnownPeer(key_hash))
    }
 }
+impl Display for KnownPeer {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      write!(f, "{}", hex::encode(self.0))
+   }
+}
 fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
    use std::io::ErrorKind;
    let path = CONFIG_DIR.join("known_peers");
@@ -129,8 +134,7 @@ fn add_known_peer(peer: KnownPeer) -> Result<()> {
          file.write_all(b"\n")?;
       }
    }
-   file.write_all(hex::encode(peer.0).as_bytes())?;
-   file.write_all(b"\n")?;
+   writeln!(file, "{}", peer)?;
    Ok(())
 }
 /// Extracts the key hash of the peer's certificate, used to identify a peer in the known peers list
