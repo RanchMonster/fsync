@@ -5,6 +5,7 @@ use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInf
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, ServerConfig};
 use rcgen::CertificateParams;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{
    sync::watch,
@@ -13,12 +14,26 @@ use tokio::{
 use tracing::instrument;
 
 use crate::keys::get_signing_key;
+use crate::protocol::p2p_auth::PairMode;
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
+
+// cleaner then a bunch of arguments
+struct ServiceConfigArgs {
+   address: Option<String>,
+   port: Option<u16>,
+   // this field is required
+   sync_dirs: Vec<String>,
+   pair_mode: Option<PairMode>,
+   hostname: Option<String>,
+   // add more as needed
+   // once we have figured out a config and put stuff togother more we will need to add this
+   // sync_dirs: todo!("whatever we use to represent sync dirs"),
+}
 async fn start_service() -> Result<()> {
    let service_daemon = advertise().await?;
    let server_config = todo!("Configure server/tls");
