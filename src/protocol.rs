@@ -14,7 +14,7 @@ use tokio::{
 use tracing::instrument;
 
 use crate::keys::get_signing_key;
-use crate::protocol::p2p_auth::PairMode;
+use crate::protocol::p2p_auth::{PairMode, configure_server, handle_incoming};
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
@@ -24,51 +24,81 @@ pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 
 // cleaner then a bunch of arguments
 struct ServiceConfigArgs {
-   address: Option<String>,
-   port: Option<u16>,
+   pub address: Option<String>,
+   pub port: Option<u16>,
    // this field is required
-   sync_dirs: Vec<String>,
-   pair_mode: Option<PairMode>,
-   hostname: Option<String>,
+   pub sync_dirs: Vec<String>,
+   pub pair_mode: Option<PairMode>,
+   pub hostname: Option<String>,
    // add more as needed
    // once we have figured out a config and put stuff togother more we will need to add this
    // sync_dirs: todo!("whatever we use to represent sync dirs"),
 }
-async fn start_service() -> Result<()> {
-   let service_daemon = advertise().await?;
-   let server_config = todo!("Configure server/tls");
-   let address = std::env::var("ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
-   let port = std::env::var("PORT")
-      .ok()
-      .and_then(|val| val.parse::<u16>().ok())
-      .unwrap_or(DEFAULT_PORT);
+async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
+   // load args from the config given
+   let hostname = config_args.hostname.unwrap_or_else(|| {
+      let mut name = hostname::get()
+         .expect("Failed to get hostname")
+         .to_string_lossy()
+         .to_string();
+      if name.len() > 15 {
+         tracing::warn!("Hostname is longer than 15 characters, truncating");
+         name.truncate(15);
+      }
+      name
+   });
+   assert!(!hostname.is_empty(), "Hostname cannot be empty");
+   assert!(
+      hostname.len() <= 15,
+      "Hostname cannot be longer than 15 characters"
+   );
+   let address = config_args.address.unwrap_or_else(|| "0.0.0.0".to_string());
+   let port = config_args.port.unwrap_or(DEFAULT_PORT);
+   let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
+
+   // configure the serve and attempt to locate peers on the network that we can talk to
+   let server_config = configure_server(&hostname)?;
    let mut endpoint = Endpoint::server(
       server_config,
       format!("{address}:{port}")
          .parse()
-         .expect("Invalid address"),
+         .expect("Invalid address or port"),
    )?;
-   Ok(())
+   let local_addr = endpoint.local_addr()?;
+   tracing::debug!("Listening on {local_addr}");
+
+   tracing::debug!("Advertising {hostname}");
+   // start the advertisement daemon
+   let advertise_daemon = advertise(local_addr, hostname).await?;
+   tracing::debug!("Looking for peers");
+   let browser = advertise_daemon.browse(SERVICE_TYPE)?;
+
+   // event loop for the service
+   'service: loop {
+      tokio::select! {
+            accept = endpoint.accept() => {
+            let incoming = accept.expect("Server closed unexpectedly");
+            tracing::debug!("Accepted connection {incoming:?}");
+            handle_incoming(incoming, &pair_mode).await?;
+         }
+         event = browser.recv_async() => {
+            todo!("handle events");
+         }
+      }
+   }
 }
-async fn advertise() -> Result<ServiceDaemon> {
+
+async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceDaemon> {
+   assert!(!hostname.is_empty(), "Hostname cannot be empty");
+   assert!(
+      hostname.len() <= 15,
+      "Hostname cannot be longer than 15 characters"
+   );
    let mdns = task::spawn_blocking(move || {
       let mdns = ServiceDaemon::new().expect("Failed to create mdns daemon");
-      let mut hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
-         hostname::get()
-            .expect("Failed to get hostname")
-            .to_string_lossy()
-            .to_string()
-      });
-      if !hostname.len() > 15 {
-         tracing::warn!("Hostname is too long to advertise and will be truncated to 15 characters");
-         hostname.truncate(15);
-      }
       // load the address from the environment variable or default to auto assigned
-      let address = std::env::var("ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
-      let port = std::env::var("PORT")
-         .ok()
-         .and_then(|val| val.parse::<u16>().ok())
-         .unwrap_or(DEFAULT_PORT);
+      let address = socket_adrr.ip().to_string();
+      let port = socket_adrr.port();
       let service_info = ServiceInfo::new(
          SERVICE_TYPE,
          &hostname,
