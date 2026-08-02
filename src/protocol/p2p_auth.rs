@@ -319,7 +319,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
             "Generated key must be 23 characters long when encoded with dashes"
          );
          let mut response_key = [0; 8];
-         let data = some_or_reject!(
+         let _data = some_or_reject!(
             channel_rx.read(&mut response_key).await?,
             "peer did not respond to key request"
          );

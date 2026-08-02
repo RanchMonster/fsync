@@ -1,7 +1,7 @@
 use crate::CONFIG_DIR;
 use crate::protocol::error::Result;
 use quinn::{
-   ClientConfig, Endpoint, ServerConfig,
+   ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rcgen::{CertificateParams, KeyPair};

@@ -1,19 +1,11 @@
 mod error;
 mod p2p_auth;
 pub use error::{Error, Result};
-use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
-use quinn::crypto::rustls::QuicServerConfig;
-use quinn::{Endpoint, ServerConfig};
-use rcgen::CertificateParams;
+use mdns_sd::{ServiceDaemon, ServiceInfo};
+use quinn::Endpoint;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::{
-   sync::watch,
-   task::{self, JoinHandle},
-};
-use tracing::instrument;
+use tokio::task::{self};
 
-use crate::keys::get_signing_key;
 use crate::protocol::p2p_auth::{PairMode, configure_server, handle_incoming};
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
@@ -58,7 +50,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname)?;
-   let mut endpoint = Endpoint::server(
+   let endpoint = Endpoint::server(
       server_config,
       format!("{address}:{port}")
          .parse()
@@ -81,7 +73,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
             tracing::debug!("Accepted connection {incoming:?}");
             handle_incoming(incoming, &pair_mode).await?;
          }
-         event = browser.recv_async() => {
+         _event = browser.recv_async() => {
             todo!("handle events");
          }
       }
