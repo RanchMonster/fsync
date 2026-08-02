@@ -47,14 +47,74 @@ fn generate_self_signed_cert(
    Ok((vec![cert_der], key_der))
 }
 
+fn verify_signature_tls12(
+   message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
+) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+   let provider = rustls::crypto::CryptoProvider::get_default()
+      .expect("a default CryptoProvider is installed");
+   rustls::crypto::verify_tls12_signature(
+      message,
+      cert,
+      dss,
+      &provider.signature_verification_algorithms,
+   )
+}
+
+fn verify_signature_tls13(
+   message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
+) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+   let provider = rustls::crypto::CryptoProvider::get_default()
+      .expect("a default CryptoProvider is installed");
+   rustls::crypto::verify_tls13_signature(
+      message,
+      cert,
+      dss,
+      &provider.signature_verification_algorithms,
+   )
+}
+
+#[derive(Debug)]
+struct SignatureVerifyingClientVerifier;
+
+impl rustls::server::danger::ClientCertVerifier for SignatureVerifyingClientVerifier {
+   fn offer_client_auth(&self) -> bool {
+      true
+   }
+   fn client_auth_mandatory(&self) -> bool {
+      false
+   }
+   fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+      &[]
+   }
+   fn verify_client_cert(
+      &self, _end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>],
+      _now: rustls::pki_types::UnixTime,
+   ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+      Ok(rustls::server::danger::ClientCertVerified::assertion())
+   }
+   fn verify_tls12_signature(
+      &self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
+   ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+      verify_signature_tls12(message, cert, dss)
+   }
+   fn verify_tls13_signature(
+      &self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
+   ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+      verify_signature_tls13(message, cert, dss)
+   }
+   fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+      vec![
+         rustls::SignatureScheme::ED25519,
+         rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+      ]
+   }
+}
+
 pub fn configure_server(name: &str) -> Result<ServerConfig> {
    let (cert_chain, private_key) = generate_self_signed_cert(name)?;
 
-   let client_verifier =
-      rustls::server::WebPkiClientVerifier::builder(Arc::new(rustls::RootCertStore::empty()))
-         .allow_unauthenticated()
-         .build()
-         .expect("Built with allow_unauthenticated; this is infallible");
+   let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+      Arc::new(SignatureVerifyingClientVerifier);
 
    let mut server_crypto = rustls::ServerConfig::builder()
       .with_client_cert_verifier(client_verifier)
@@ -83,16 +143,16 @@ pub fn configure_client(name: &str) -> Result<ClientConfig> {
          Ok(rustls::client::danger::ServerCertVerified::assertion())
       }
       fn verify_tls12_signature(
-         &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &rustls::DigitallySignedStruct,
+         &self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
       ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
       {
-         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+         verify_signature_tls12(message, cert, dss)
       }
       fn verify_tls13_signature(
-         &self, _message: &[u8], _cert: &CertificateDer<'_>, _dss: &rustls::DigitallySignedStruct,
+         &self, message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
       ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
       {
-         Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+         verify_signature_tls13(message, cert, dss)
       }
       fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
          vec![
