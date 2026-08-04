@@ -1,5 +1,14 @@
 use quinn::{ConnectionError, ReadError, SendDatagramError, VarInt, WriteError};
 use thiserror::Error;
+macro_rules! impl_from_quinn {
+   ($err:ty) => {
+      impl From<$err> for Error {
+         fn from(err: $err) -> Self {
+            Error::Quic(err.into())
+         }
+      }
+   };
+}
 #[derive(Error, Debug)]
 pub enum Error {
    #[error(
@@ -19,26 +28,15 @@ pub enum Error {
    #[error("Parse data error: {0}")]
    ParseData(String),
 }
-impl From<ReadError> for Error {
-   fn from(err: quinn::ReadError) -> Self {
-      Error::Quic(err.into())
-   }
-}
-impl From<WriteError> for Error {
-   fn from(err: quinn::WriteError) -> Self {
-      Error::Quic(err.into())
-   }
-}
-impl From<ConnectionError> for Error {
-   fn from(err: ConnectionError) -> Self {
-      Error::Quic(err.into())
-   }
-}
-impl From<SendDatagramError> for Error {
-   fn from(err: SendDatagramError) -> Self {
-      Error::Quic(err.into())
-   }
-}
+// The fact that quinn has this many error types is a bit of a pain and kind of annoying
+// Why do they not implement a Enum or at least a trait for this?
+// I will likely be submitting a PR to fix this at some point to quinn
+impl_from_quinn!(quinn::ConnectionError);
+impl_from_quinn!(quinn::SendDatagramError);
+impl_from_quinn!(quinn::ReadError);
+impl_from_quinn!(quinn::WriteError);
+impl_from_quinn!(quinn::ReadToEndError);
+impl_from_quinn!(quinn::ReadExactError);
 #[repr(u32)]
 pub enum CloseCode {
    InvalidProtocol = 1,
