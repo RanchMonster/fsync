@@ -178,27 +178,14 @@ fn prompt_user(prompt: &str) -> Result<String> {
    Ok(line.trim().to_string())
 }
 
-/// Reads exactly `buf.len()` bytes from a stream, erroring if the stream closes early
-async fn read_exact(stream: &mut quinn::RecvStream, buf: &mut [u8]) -> Result<()> {
-   let mut offset = 0;
-   while offset < buf.len() {
-      let read = some_or_reject!(
-         stream.read(&mut buf[offset..]).await?,
-         "stream closed during read"
-      );
-      offset += read;
-   }
-   Ok(())
-}
-
 async fn pair_client_side(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
 
    let mut mode_len = [0; 1];
-   read_exact(&mut channel_rx, &mut mode_len).await?;
+   channel_rx.read_exact(&mut mode_len).await?;
    let mut mode_buf = vec![0; mode_len[0] as usize];
-   read_exact(&mut channel_rx, &mut mode_buf).await?;
+   channel_rx.read_exact(&mut mode_buf).await?;
    let mode_str = ok_or_reject!(
       std::str::from_utf8(&mode_buf),
       "pair mode is not valid utf-8"
