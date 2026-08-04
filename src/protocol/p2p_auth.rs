@@ -308,10 +308,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
             "Generated key must be 23 characters long when encoded with dashes"
          );
          let mut response_key = [0; 8];
-         let _data = some_or_reject!(
-            channel_rx.read(&mut response_key).await?,
-            "peer did not respond to key request"
-         );
+         channel_rx.read_exact(&mut response_key).await?;
          if random_key != response_key {
             channel_tx.write_all(AuthCommands::REJECT).await?;
             return Err(PeerRejected("Key mismatch".to_string()));
