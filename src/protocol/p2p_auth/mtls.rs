@@ -6,13 +6,16 @@ use quinn::{
 };
 use rcgen::{CertificateParams, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf, sync::Arc};
-
 const PROTOCOL_NAME: &str = concat!("fsync", env!("CARGO_PKG_VERSION"));
 
 fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
    let dir = CONFIG_DIR.join("certs");
    fs::create_dir_all(&dir)?;
+   #[cfg(unix)]
+   fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
    Ok((
       dir.join(format!("{name}.cert.der")),
       dir.join(format!("{name}.key.der")),
@@ -43,15 +46,21 @@ fn generate_self_signed_cert(
 
    fs::write(&cert_path, cert_der.as_ref())?;
    fs::write(&key_path, key_pair.serialize_der())?;
-
+   // Set the permissions of the key file to 0o600 (rw-------)
+   // also I am aware of the potential for a race to read the file before permissions are set but
+   // I don't think we need to harden this to that level of security just something to be aware of
+   // in the future if I ever want to harden this further (someone else is more then welcome to
+   // submit a PR to do this I just don't want to be the one to do it)
+   #[cfg(unix)]
+   fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
    Ok((vec![cert_der], key_der))
 }
 
 fn verify_signature_tls12(
    message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
 ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-   let provider = rustls::crypto::CryptoProvider::get_default()
-      .expect("a default CryptoProvider is installed");
+   let provider =
+      rustls::crypto::CryptoProvider::get_default().expect("a default CryptoProvider is installed");
    rustls::crypto::verify_tls12_signature(
       message,
       cert,
@@ -63,8 +72,8 @@ fn verify_signature_tls12(
 fn verify_signature_tls13(
    message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
 ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-   let provider = rustls::crypto::CryptoProvider::get_default()
-      .expect("a default CryptoProvider is installed");
+   let provider =
+      rustls::crypto::CryptoProvider::get_default().expect("a default CryptoProvider is installed");
    rustls::crypto::verify_tls13_signature(
       message,
       cert,
