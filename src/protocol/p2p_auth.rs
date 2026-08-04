@@ -38,7 +38,7 @@ macro_rules! some_or_reject {
 struct AuthCommands;
 impl AuthCommands {
    const INIT: &[u8] = b"INIT";
-   const AKNOWLEDGE: &[u8] = b"AKNOWLEDGE";
+   const ACKNOWLEDGE: &[u8] = b"ACKNOWLEDGE";
    const HOLD: &[u8] = b"HOLD";
    const REJECT: &[u8] = b"REJECT";
    const ACCEPT: &[u8] = b"ACCEPT";
@@ -347,7 +347,7 @@ pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()>
       .map_err(Error::from)?;
    authenticate_peer(connection).await?;
    match timeout(Duration::from_secs(5), connection.read_datagram()).await {
-      Ok(Ok(data)) if data.starts_with(AuthCommands::AKNOWLEDGE) => Ok(()),
+      Ok(Ok(data)) if data.starts_with(AuthCommands::ACKNOWLEDGE) => Ok(()),
       _ => Err(PeerRejected("peer connection timed out".to_string())),
    }
 }
@@ -376,7 +376,7 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
       match authenticate_peer(&mut connection).await {
          Ok(_) => {
             connection
-               .send_datagram(AuthCommands::AKNOWLEDGE.into())
+               .send_datagram(AuthCommands::ACKNOWLEDGE.into())
                .map_err(Error::from)?;
             Ok(connection)
          }
