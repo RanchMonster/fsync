@@ -271,7 +271,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 
       Password(password) => {
          let password = password.clone();
-         let mut client_password = [0; 256]; // any password longer than this is rejected
+         let mut client_password = [0u8; 256]; // any password longer than this is rejected
          let read = channel_rx
             .read(&mut client_password)
             .await?
@@ -281,6 +281,8 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
                "Password must be at least 1 character long".to_string(),
             ));
          }
+
+         let client_password = client_password[..read].to_vec();
          let verifier = Argon2::default();
          let accept = ok_or_reject!(
             task::spawn_blocking(move || {
