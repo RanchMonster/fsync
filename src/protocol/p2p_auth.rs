@@ -440,7 +440,7 @@ mod tests {
    #[tokio::test]
    async fn test_pair_peer_relaxed() {
       use quinn::Endpoint;
-      // gernerate key and cert for virtual peers
+      // generate key and cert for virtual peers
       let server_config =
          mtls::configure_server("test-peer-server").expect("failed to configure server crypto");
       let client_config =
