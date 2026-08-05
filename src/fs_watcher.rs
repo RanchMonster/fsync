@@ -1,5 +1,6 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, Watcher};
+use std::fs;
 use std::{
    collections::HashMap,
    ops::{Deref, DerefMut},
