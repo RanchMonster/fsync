@@ -1,17 +1,16 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use notify::{Event, EventHandler, EventKind, RecommendedWatcher, Watcher};
+use notify::{Event, RecommendedWatcher, Watcher};
 use std::{
-   collections::{HashMap, HashSet},
-   fs,
+   collections::HashMap,
    ops::{Deref, DerefMut},
    path::{Path, PathBuf},
-   sync::{Arc, LazyLock},
-   time::{Duration, Instant},
+   sync::Arc,
+   time::Duration,
 };
 use thiserror::Error;
 use tokio::{
-   sync::{Mutex, MutexGuard, RwLock, broadcast, mpsc},
-   task::{self, JoinHandle},
+   sync::{Mutex, broadcast, mpsc},
+   task::{self},
 };
 use tracing::instrument;
 // Macros
