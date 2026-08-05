@@ -1,245 +1,111 @@
 mod error;
+mod p2p_auth;
 pub use error::{Error, Result};
-use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::sync::Arc;
-use tokio::{
-   sync::Mutex,
-   task::{self, JoinHandle},
-};
-use tracing::instrument;
+use mdns_sd::{ServiceDaemon, ServiceInfo};
+use quinn::Endpoint;
+use std::net::SocketAddr;
+use tokio::task::{self};
+
+use crate::protocol::p2p_auth::{PairMode, configure_server, handle_incoming};
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
+pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 
-/// Represents a peer in the network this is mostly like not the actual peer but is a placeholder
-/// until I have figure out what I actual need to know about a peer
-#[derive(Clone, Debug)]
-pub struct Peer {
-   version: String,
-   addresses: Vec<String>,
-   hostname: String,
-   port: u16,
+// cleaner then a bunch of arguments
+struct ServiceConfigArgs {
+   pub address: Option<String>,
+   pub port: Option<u16>,
+   // this field is required
+   pub sync_dirs: Vec<String>,
+   pub pair_mode: Option<PairMode>,
+   pub hostname: Option<String>,
+   // add more as needed
+   // once we have figured out a config and put stuff togother more we will need to add this
+   // sync_dirs: todo!("whatever we use to represent sync dirs"),
 }
-
-impl TryFrom<ResolvedService> for Peer {
-   type Error = Error;
-   #[instrument]
-   fn try_from(resolved: ResolvedService) -> Result<Self> {
-      let version = resolved
-         .txt_properties
-         .get(VERSION_KEY_PROPERTY)
-         .ok_or(Error::InvalidPeer(resolved.clone()))?
-         .val()
-         .and_then(|v| std::str::from_utf8(v).ok())
-         .unwrap_or_default()
+async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
+   // load args from the config given
+   let hostname = config_args.hostname.unwrap_or_else(|| {
+      let mut name = hostname::get()
+         .expect("Failed to get hostname")
+         .to_string_lossy()
          .to_string();
+      if name.len() > 15 {
+         tracing::warn!("Hostname is longer than 15 characters, truncating");
+         name.truncate(15);
+      }
+      name
+   });
+   assert!(!hostname.is_empty(), "Hostname cannot be empty");
+   assert!(
+      hostname.len() <= 15,
+      "Hostname cannot be longer than 15 characters"
+   );
+   let address = config_args.address.unwrap_or_else(|| "0.0.0.0".to_string());
+   let port = config_args.port.unwrap_or(DEFAULT_PORT);
+   let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
 
-      let addresses = resolved
-         .addresses
-         .iter()
-         .map(|address| address.to_ip_addr().to_canonical().to_string())
-         .collect();
+   // configure the serve and attempt to locate peers on the network that we can talk to
+   let server_config = configure_server(&hostname)?;
+   let endpoint = Endpoint::server(
+      server_config,
+      format!("{address}:{port}")
+         .parse()
+         .expect("Invalid address or port"),
+   )?;
+   let local_addr = endpoint.local_addr()?;
+   tracing::debug!("Listening on {local_addr}");
 
-      let hostname = resolved.get_hostname().to_string();
-      let port = resolved.port;
+   tracing::debug!("Advertising {hostname}");
+   // start the advertisement daemon
+   let advertise_daemon = advertise(local_addr, hostname).await?;
+   tracing::debug!("Looking for peers");
+   let browser = advertise_daemon.browse(SERVICE_TYPE)?;
 
-      Ok(Peer {
-         version,
-         addresses,
-         hostname,
+   // event loop for the service
+   'service: loop {
+      tokio::select! {
+            accept = endpoint.accept() => {
+            let incoming = accept.expect("Server closed unexpectedly");
+            tracing::debug!("Accepted connection {incoming:?}");
+            handle_incoming(incoming, &pair_mode).await?;
+         }
+         _event = browser.recv_async() => {
+            todo!("handle events");
+         }
+      }
+   }
+}
+
+async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceDaemon> {
+   assert!(!hostname.is_empty(), "Hostname cannot be empty");
+   assert!(
+      hostname.len() <= 15,
+      "Hostname cannot be longer than 15 characters"
+   );
+   let mdns = task::spawn_blocking(move || {
+      let mdns = ServiceDaemon::new().expect("Failed to create mdns daemon");
+      // load the address from the environment variable or default to auto assigned
+      let address = socket_adrr.ip().to_string();
+      let port = socket_adrr.port();
+      let service_info = ServiceInfo::new(
+         SERVICE_TYPE,
+         &hostname,
+         format!("{hostname}.local.").as_str(),
+         address,
          port,
-      })
-   }
-}
+         [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
+      )?
+      .enable_addr_auto();
+      mdns.register(service_info)?;
 
-impl Peer {
-   pub fn compatible(&self) -> bool {
-      todo!("check if the peer is compatible")
-   }
+      Ok::<_, Error>(mdns)
+   })
+   .await;
+   let mdns = mdns.expect("Thread unexpectedly panicked")?;
 
-   pub fn version(&self) -> &str {
-      &self.version
-   }
-
-   /// Find the first valid address
-   /// This function is not yet implemented and will require
-   /// a custom endpoint for QUIC I will implement this when I get to QUIC
-   pub async fn valid_address(&self) -> &str {
-      todo!("find the first valid address")
-   }
-
-   pub fn port(&self) -> u16 {
-      self.port
-   }
-
-   pub fn is_local(&self) -> bool {
-      todo!("check if the peer is local")
-   }
-}
-
-macro_rules! unwrap_or_create_daemon {
-   ($daemon:expr) => {
-      match $daemon {
-         Some(daemon) => daemon,
-         None => ServiceDaemon::new().expect("Failed to create mdns daemon"),
-      }
-   };
-}
-
-pub struct ServiceScanner<'daemon> {
-   inner: Receiver<ServiceEvent>,
-   daemon: &'daemon ServiceDaemon,
-}
-
-impl<'daemon> ServiceScanner<'daemon> {
-   pub async fn next_peer(&mut self) -> Option<Peer> {
-      use ServiceEvent::*;
-
-      loop {
-         let event = self.inner.recv_async().await.ok()?;
-         if let ServiceResolved(resolved) = event {
-            return (*resolved).try_into().ok();
-         }
-      }
-   }
-}
-
-pub struct Service {
-   daemon: Option<ServiceDaemon>,
-   peers: Arc<Mutex<Vec<Peer>>>,
-   join_handle: Option<JoinHandle<()>>,
-   is_advertising: bool,
-}
-impl Service {
-   pub async fn new() -> Self {
-      Self {
-         daemon: None,
-         peers: Arc::new(Mutex::new(Vec::new())),
-         join_handle: None,
-         is_advertising: false,
-      }
-   }
-
-   pub async fn stop(&mut self) -> Result<()> {
-      self.stop_advertising().await?;
-
-      if let Some(join_handle) = self.join_handle.take() {
-         join_handle.abort();
-      }
-
-      self.peers.lock().await.clear();
-      Ok(())
-   }
-
-   pub async fn connected(&self) -> Vec<Peer> {
-      (*self.peers.lock().await).clone()
-   }
-
-   pub async fn start(&mut self) -> Result<()> {
-      task::spawn(async move { todo!("start the service") });
-      Ok(())
-   }
-
-   pub async fn discover_peers(&mut self) -> Result<ServiceScanner> {
-      let daemon = self.daemon.take();
-
-      let result = task::spawn_blocking(move || {
-         let mdns = unwrap_or_create_daemon!(daemon);
-         let receiver = mdns.browse(SERVICE_TYPE)?;
-         Ok::<_, Error>((receiver, mdns))
-      })
-      .await;
-
-      let (receiver, mdns) =
-         result.expect("Failed to start peer discovery service state damaged")?;
-      self.daemon = Some(mdns);
-
-      let daemon = self.daemon.as_ref().unwrap();
-      let scanner = ServiceScanner {
-         inner: receiver,
-         daemon,
-      };
-
-      Ok(scanner)
-   }
-   pub async fn advertise(&mut self) -> Result<()> {
-      assert!(!self.is_advertising, "Service was already advertising");
-
-      let daemon = self.daemon.take();
-      let mdns = task::spawn_blocking(move || {
-         let mdns = unwrap_or_create_daemon!(daemon);
-
-         let mut hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
-            hostname::get()
-               .expect("Failed to get hostname")
-               .to_string_lossy()
-               .to_string()
-         });
-
-         if !hostname.len() > 15 {
-            tracing::warn!(
-               "Hostname is too long to advertise and will be truncated to 15 characters"
-            );
-            hostname.truncate(15);
-         }
-
-         // load the address from the environment variable or default to auto assigned
-         let address = std::env::var("ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
-         let port = std::env::var("PORT")
-            .ok()
-            .and_then(|val| val.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_PORT);
-
-         let service_info = ServiceInfo::new(
-            SERVICE_TYPE,
-            &hostname,
-            format!("{hostname}.local.").as_str(),
-            address,
-            port,
-            [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
-         )?
-         .enable_addr_auto();
-         mdns.register(service_info)?;
-
-         Ok::<_, Error>(mdns)
-      })
-      .await;
-
-      let mdns = mdns.expect("Thread unexpectedly panicked")?;
-      self.daemon = Some(mdns);
-
-      Ok(())
-   }
-   async fn stop_advertising(&mut self) -> Result<()> {
-      assert!(
-         self.is_advertising,
-         "Service was not advertising before stopping"
-      );
-      if let Some(daemon) = &mut self.daemon {
-         daemon.unregister(SERVICE_TYPE)?;
-      }
-      Ok(())
-   }
-}
-
-// This test case might change in the future after I get QUIC implemented
-#[tokio::test]
-async fn mmdns_service_testdns_service_test() {
-   let mut service = Service::new().await;
-   service.advertise().await.unwrap();
-   let mut scanner = service.discover_peers().await.unwrap();
-   let hostname = hostname::get().unwrap().to_string_lossy().to_string();
-   while let Some(peer) = scanner.next_peer().await {
-      if peer
-         .hostname
-         .strip_suffix(".local.")
-         .expect("Hostname must end with .local.")
-         == hostname
-      {
-         return;
-      }
-   }
-   panic!("Failed to find self in peer list");
+   Ok(mdns)
 }

@@ -39,9 +39,9 @@ fsync is a decentralized peer-to-peer file synchronization system. Devices on th
 - [x] Peer discovery on LAN
 
 ### Phase 2: Encrypted Transport
-- [ ] QUIC via quinn
-- [ ] Ed25519 keypair for peer identity
-- [ ] Self-signed TLS cert from keypair
+- [x] QUIC via quinn
+- [x] Ed25519 keypair for peer identity
+- [x] Self-signed TLS cert from keypair
 - [ ] Streams for file transfer
 - [ ] Datagrams for change notifications
 
