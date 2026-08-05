@@ -89,7 +89,7 @@ impl Display for KnownPeer {
 /// Checks whether the given key hash is present in the known peers list
 /// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
 /// list, so this returns `Ok(false)` rather than an error.
-fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
+pub fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
    use ErrorKind::NotFound;
    let path = CONFIG_DIR.join("known_peers");
    let file = match std::fs::File::open(&path) {
@@ -202,7 +202,7 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
 ///
 /// Returns [`Error::PeerRejected`] if the peer is not a known peer. Errors
 /// from the known peers lookup are propagated.
-async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
+pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let peer_id = peer_key_hash(connection)?;
    let is_known = ok_or_reject!(

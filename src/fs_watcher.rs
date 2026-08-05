@@ -2,6 +2,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, Watcher};
 use std::{
    collections::HashMap,
+   fs,
    ops::{Deref, DerefMut},
    path::{Path, PathBuf},
    sync::Arc,
