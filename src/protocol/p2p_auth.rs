@@ -89,7 +89,7 @@ impl Display for KnownPeer {
 /// Checks whether the given key hash is present in the known peers list
 /// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
 /// list, so this returns `Ok(false)` rather than an error.
-fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
+pub fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
    use ErrorKind::NotFound;
    let path = CONFIG_DIR.join("known_peers");
    let file = match std::fs::File::open(&path) {
