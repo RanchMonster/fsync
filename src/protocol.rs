@@ -19,25 +19,9 @@ const DEFAULT_PORT: u16 = 43127;
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
-fn make_server_config() -> quinn::ServerConfig {
-   let keypair = get_signing_key();
-   let cert = CertificateParams::new(vec!["fsync".into()])
-      .expect("Failed to create certificate params")
-      .self_signed(&keypair)
-      .expect("Failed to create self signed certificate");
-
-   let rustls_config = rustls::ServerConfig::builder()
-      .with_no_client_auth()
-      .with_single_cert(vec![cert.der().clone()], keypair.into())
-      .expect("Failed to create rustls config");
-   let quic_config =
-      QuicServerConfig::try_from(rustls_config).expect("Failed to create quic config");
-
-   quinn::ServerConfig::with_crypto(Arc::new(quic_config))
-}
 async fn start_service() -> Result<()> {
    let service_daemon = advertise().await?;
-   let server_config = make_server_config();
+   let server_config = todo!("Configure server/tls");
    let address = std::env::var("ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string());
    let port = std::env::var("PORT")
       .ok()
