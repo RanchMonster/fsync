@@ -1,3 +1,19 @@
+//! Authenticated peer authentication and pairing over QUIC.
+//!
+//! This module implements the handshake that runs on every QUIC connection
+//! accepted by fsync. The transport layer is secured with mutual TLS (mTLS),
+//! configured in the [`mtls`] submodule, so the peer's certificate is
+//! available during the handshake. This module then decides whether an
+//! already-known peer is authenticated directly or whether an unknown peer
+//! must go through the pairing exchange described by [`PairMode`].
+//!
+//! The client announces itself with an `INIT` datagram (known-peer
+//! authentication, acknowledged by the server) or with a `PAIR` datagram
+//! (a pairing request). The server, driven by [`handle_incoming`], waits up
+//! to five seconds for the client's first datagram.
+//! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
+//! points; [`pair_peer`] runs the shared pairing exchange over a
+//! bidirectional stream once it is established.
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
 use quinn::{Connection, Incoming, Side};
 use rand::random;
@@ -14,9 +30,12 @@ use x509_parser::nom::AsBytes;
 mod mtls;
 use super::error::*;
 use crate::CONFIG_DIR;
+/// Re-exports the mTLS server config builder from the `mtls` submodule.
 pub use mtls::configure_server;
-/// A macro to read a datagram from a connection with a timeout
+use std::io::ErrorKind;
 
+/// A macro to unwrap a `Result`, returning an [`Error::PeerRejected`] with
+/// the given message on error.
 macro_rules! ok_or_reject {
    ($e:expr,$msg:expr) => {
       match $e {
@@ -25,6 +44,8 @@ macro_rules! ok_or_reject {
       }
    };
 }
+/// Unwraps an `Option` value, returning an [`Error::PeerRejected`] with the
+/// given message on `None`.
 macro_rules! some_or_reject {
    ($e:expr,$msg:expr) => {
       match $e {
@@ -35,6 +56,8 @@ macro_rules! some_or_reject {
 }
 
 // I hate handling it like this but rust won't let me do it with a Enum
+/// The set of wire-level commands exchanged during the authentication and
+/// pairing handshakes.
 struct AuthCommands;
 impl AuthCommands {
    const INIT: &[u8] = b"INIT";
@@ -44,6 +67,7 @@ impl AuthCommands {
    const ACCEPT: &[u8] = b"ACCEPT";
    const PAIR: &[u8] = b"PAIR";
 }
+/// A peer identity: the blake3 hash of a peer certificate's public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct KnownPeer([u8; 32]);
 
@@ -62,12 +86,15 @@ impl Display for KnownPeer {
       write!(f, "{}", hex::encode(self.0))
    }
 }
+/// Checks whether the given key hash is present in the known peers list
+/// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
+/// list, so this returns `Ok(false)` rather than an error.
 fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
-   use std::io::ErrorKind;
+   use ErrorKind::NotFound;
    let path = CONFIG_DIR.join("known_peers");
    let file = match std::fs::File::open(&path) {
       Ok(file) => file,
-      Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+      Err(err) if err.kind() == NotFound => return Ok(false),
       Err(err) => return Err(err.into()),
    };
    for line in BufReader::new(file).lines() {
@@ -82,16 +109,23 @@ fn is_known_peers(key_hash: &[u8; 32]) -> Result<bool> {
    }
    Ok(false)
 }
-/// Represents the pairing mode of this device
+/// Represents the pairing mode of this device: how the server side handles a
+/// `PAIR` request from an unknown peer. The `Display` form of the mode is what
+/// is announced to the pairing client over the wire. The default is
+/// [`PairMode::Relaxed`].
 #[derive(Debug)]
 pub enum PairMode {
-   /// Strict creates a random key that must be entered by the other device
+   /// Strict mode: a random key is generated and announced, and the other
+   /// device must enter it to complete the pairing.
    Strict,
-   /// Relaxed allows other devices to connect without any confirmation from this device
+   /// Relaxed mode: other devices can connect without any confirmation from
+   /// this device.
    Relaxed,
-   /// Password allows other devices to connect to this device with a password
+   /// Password mode: other devices can connect to this device by providing
+   /// the password whose hash is stored in this variant.
    Password(Arc<PasswordHashString>),
-   /// KeyOnly requires users to manually copy the public key to both devices
+   /// Key only mode: pairing is not allowed; users must manually copy the
+   /// public key to both devices instead.
    KeyOnly,
    // Add other modes here as needed
 }
@@ -111,6 +145,8 @@ impl Default for PairMode {
       Self::Relaxed
    }
 }
+/// Records the given peer in the known peers list, appending it if it is not
+/// already present.
 fn add_known_peer(peer: KnownPeer) -> Result<()> {
    if is_known_peers(&peer.0)? {
       return Ok(());
@@ -131,7 +167,13 @@ fn add_known_peer(peer: KnownPeer) -> Result<()> {
    writeln!(file, "{}", peer)?;
    Ok(())
 }
-/// Extracts the key hash of the peer's certificate, used to identify a peer in the known peers list
+/// Extracts the blake3 hash of the peer certificate's public key, used to
+/// identify the peer in the known peers list.
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] if the connection has no peer identity or
+/// the identity is not a valid certificate chain.
 fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
    let identity = some_or_reject!(connection.peer_identity(), "no peer identity");
 
@@ -153,7 +195,13 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
    let public_key = x509_cert.public_key().raw;
    Ok(*blake3::hash(public_key).as_bytes())
 }
-/// This function is used for authenticating peers who claim to be known to us already
+/// Authenticates a peer that claims to be known to us by checking its key
+/// hash against the known peers list.
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] if the peer is not a known peer. Errors
+/// from the known peers lookup are propagated.
 async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let peer_id = peer_key_hash(connection)?;
@@ -167,7 +215,11 @@ async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    Ok(())
 }
 
-/// Prompts the user for input on stdin
+/// Prompts the user for input on stdin, returning the trimmed line.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if writing the prompt or reading the input fails.
 fn prompt_user(prompt: &str) -> Result<String> {
    use std::io::{stdin, stdout};
    let mut stdout = stdout();
@@ -178,6 +230,9 @@ fn prompt_user(prompt: &str) -> Result<String> {
    Ok(line.trim().to_string())
 }
 
+/// Client side of the pairing exchange: reads the pair mode announced by the
+/// server and provides the requested credentials, then records the peer as
+/// known on a successful exchange.
 async fn pair_client_side(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
@@ -249,6 +304,8 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
    }
 }
 
+/// Server side of the pairing exchange: announces the configured pair mode,
+/// validates the client's response, and records the peer as known on success.
 async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
    use Error::PeerRejected;
    use PairMode::*;
@@ -323,6 +380,26 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
    Ok(())
 }
 
+/// Runs the pairing handshake over an established QUIC connection.
+///
+/// The exchange is driven by the connection's role: the client side reads the
+/// pair mode announced by the server and supplies the requested credentials,
+/// while the server side announces its configured [`PairMode`] and validates
+/// the client's response. Both sides record the peer in the known peers list
+/// when the pairing succeeds.
+///
+/// # Arguments
+///
+/// * `connection` - the established QUIC connection to the peer.
+/// * `pair_mode` - the mode used on the server side of the exchange. It is
+///   required (this function panics if it is `None` on the server side) and
+///   is ignored on the client side.
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] when the server rejects the pairing or the
+/// client reads a `REJECT` response. Returns [`Error::ParseData`] for an
+/// unknown pair mode, an invalid pairing key, or an unexpected response.
 pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>) -> Result<()> {
    use Side::{Client, Server};
    match connection.side() {
@@ -336,7 +413,17 @@ pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>
       }
    }
 }
-/// Client side of the authenticated handshake: announces we are a known peer and verifies the server
+/// Client side of the authenticated handshake: announces that we are a known
+/// peer and verifies that the server acknowledges us.
+///
+/// Sends an `INIT` datagram, checks that this peer is in the known peers
+/// list, then waits up to five seconds for the server's `ACKNOWLEDGE`
+/// datagram.
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] if the peer is not a known peer or the
+/// server does not acknowledge the connection within the timeout.
 pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    connection
@@ -348,13 +435,42 @@ pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()>
       _ => Err(PeerRejected("peer connection timed out".to_string())),
    }
 }
-/// Client side of the pairing handshake: announces a pairing request and runs the exchange
+/// Client side of the pairing handshake: announces a pairing request and runs
+/// the exchange with the server.
+///
+/// Sends a `PAIR` datagram, then delegates the rest of the exchange to
+/// [`pair_peer`].
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] if the server rejects the pairing, and
+/// [`Error::ParseData`] if the server announces an unknown pair mode or sends
+/// an unexpected response.
 pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
    connection
       .send_datagram(AuthCommands::PAIR.into())
       .map_err(Error::from)?;
    pair_peer(connection, None).await
 }
+/// Server side of the handshake: accepts an incoming QUIC connection and
+/// authenticates it.
+///
+/// Waits up to five seconds for the client's first datagram. A datagram
+/// starting with `INIT` triggers known-peer authentication, after which the
+/// server replies with `ACKNOWLEDGE` and returns the connection. A datagram
+/// starting with `PAIR` runs the pairing exchange in the given [`PairMode`].
+/// Any other data is rejected and the connection is closed.
+///
+/// # Arguments
+///
+/// * `incoming` - the incoming connection attempt to accept.
+/// * `pair_mode` - the pairing mode used to handle `PAIR` requests.
+///
+/// # Errors
+///
+/// Returns [`Error::PeerRejected`] if the peer is unknown, the handshake
+/// times out, the pairing is rejected, or an invalid command is received. On
+/// failure the connection is closed with [`CloseCode::AuthenticationFailure`].
 pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result<Connection> {
    use CloseCode::AuthenticationFailure;
    use Error::PeerRejected;

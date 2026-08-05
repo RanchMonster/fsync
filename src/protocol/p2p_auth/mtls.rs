@@ -1,3 +1,16 @@
+//! mTLS configuration for fsync's QUIC connections.
+//!
+//! This module builds the quinn TLS configs used by fsync's endpoints.
+//! Because fsync peers do not have certificates issued by a shared CA, each
+//! device generates a self-signed certificate on first use and caches it (and
+//! its key) by `name` in `CONFIG_DIR/certs`, giving a device a stable
+//! identity across restarts.
+//!
+//! [`configure_server`] enables client authentication with a verifier that
+//! checks the client certificate's signature but not its chain of trust;
+//! [`configure_client`] skips server certificate validation entirely. Peer
+//! authenticity is instead established by the application-layer handshake in
+//! the parent `p2p_auth` module.
 use crate::CONFIG_DIR;
 use crate::protocol::error::Result;
 use quinn::{
@@ -11,6 +24,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf, sync::Arc};
 const PROTOCOL_NAME: &str = concat!("fsync", env!("CARGO_PKG_VERSION"));
 
+/// Returns the on-disk paths for the cached certificate and private key for
+/// the given name, creating the `CONFIG_DIR/certs` directory (permissioned
+/// `0o700` on unix) if it does not exist.
 fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
    let dir = CONFIG_DIR.join("certs");
    fs::create_dir_all(&dir)?;
@@ -22,6 +38,18 @@ fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
    ))
 }
 
+/// Returns a self-signed certificate chain and private key for the given
+/// name, generating and caching them on first use.
+///
+/// If both the cached cert and key files already exist under
+/// `CONFIG_DIR/certs`, they are loaded and returned instead of regenerated.
+/// Otherwise a new self-signed certificate (with the name as its DNS subject
+/// alternative name) is generated, written to disk, and returned.
+///
+/// # Errors
+///
+/// Returns `Error::Io` if the cache files cannot be read or written, and
+/// `Error::Rcgen` if the certificate or key cannot be generated.
 fn generate_self_signed_cert(
    name: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
@@ -56,6 +84,8 @@ fn generate_self_signed_cert(
    Ok((vec![cert_der], key_der))
 }
 
+/// Verifies a TLS 1.2 handshake signature against the given certificate using
+/// the default crypto provider's signature verification algorithms.
 fn verify_signature_tls12(
    message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
 ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
@@ -69,6 +99,8 @@ fn verify_signature_tls12(
    )
 }
 
+/// Verifies a TLS 1.3 handshake signature against the given certificate using
+/// the default crypto provider's signature verification algorithms.
 fn verify_signature_tls13(
    message: &[u8], cert: &CertificateDer<'_>, dss: &rustls::DigitallySignedStruct,
 ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
@@ -82,6 +114,13 @@ fn verify_signature_tls13(
    )
 }
 
+/// Server-side certificate verifier that authenticates client certificates.
+///
+/// Client authentication is offered but not mandatory. The certificate's
+/// handshake signature is verified against the supported schemes, but no
+/// trust chain is checked (`verify_client_cert` always accepts the
+/// certificate). Peer authenticity is established later by the
+/// application-layer handshake in the parent `p2p_auth` module.
 #[derive(Debug)]
 struct SignatureVerifyingClientVerifier;
 
@@ -119,6 +158,17 @@ impl rustls::server::danger::ClientCertVerifier for SignatureVerifyingClientVeri
    }
 }
 
+/// Builds a quinn [`ServerConfig`] for fsync's QUIC server endpoint.
+///
+/// The server presents a self-signed certificate identified by `name` (see
+/// [`generate_self_signed_cert`]) and authenticates clients via
+/// [`SignatureVerifyingClientVerifier`]. The ALPN protocol is set to the
+/// fsync protocol name.
+///
+/// # Errors
+///
+/// Returns `Error::Io` if the cached certificate and key cannot be read or
+/// written, and `Error::Rcgen` if certificate generation fails.
 pub fn configure_server(name: &str) -> Result<ServerConfig> {
    let (cert_chain, private_key) = generate_self_signed_cert(name)?;
 
@@ -138,9 +188,27 @@ pub fn configure_server(name: &str) -> Result<ServerConfig> {
    )))
 }
 
+/// Builds a quinn [`ClientConfig`] for fsync's QUIC client endpoint.
+///
+/// The client presents a self-signed certificate identified by `name` (see
+/// [`generate_self_signed_cert`]) and skips server certificate validation via
+/// `DangerNoVerifier`. The ALPN protocol is set to the fsync protocol name.
+///
+/// # Errors
+///
+/// Returns `Error::Io` if the cached certificate and key cannot be read or
+/// written, and `Error::Rcgen` if certificate generation fails.
 pub fn configure_client(name: &str) -> Result<ClientConfig> {
    let (cert_chain, private_key) = generate_self_signed_cert(name)?;
 
+   /// Client-side certificate verifier that skips server certificate
+   /// validation.
+   ///
+   /// `verify_server_cert` always accepts the presented certificate; only the
+   /// handshake signature is verified. fsync peers use self-signed
+   /// certificates with no shared trust root, so authenticity is instead
+   /// established by the application-layer handshake in the parent `p2p_auth`
+   /// module.
    #[derive(Debug)]
    struct DangerNoVerifier;
    impl rustls::client::danger::ServerCertVerifier for DangerNoVerifier {
