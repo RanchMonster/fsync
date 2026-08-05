@@ -1,4 +1,5 @@
 mod error;
+mod p2p_auth;
 pub use error::{Error, Result};
 use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::crypto::rustls::QuicServerConfig;
@@ -17,7 +18,7 @@ const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
-
+pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 fn make_server_config() -> quinn::ServerConfig {
    let keypair = get_signing_key();
    let cert = CertificateParams::new(vec!["fsync".into()])
