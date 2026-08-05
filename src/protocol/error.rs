@@ -1,4 +1,4 @@
-use quinn::{ConnectionError, ReadError, SendDatagramError, VarInt, WriteError};
+use quinn::VarInt;
 use thiserror::Error;
 macro_rules! impl_from_quinn {
    ($err:ty) => {

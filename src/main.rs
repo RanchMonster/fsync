@@ -2,9 +2,7 @@ use blake3::Hash;
 mod fs_watcher;
 mod protocol;
 
-use fs_watcher::WatcherThread;
 use std::{
-   env::temp_dir,
    fs::create_dir_all,
    path::{Path, PathBuf},
    sync::LazyLock,
@@ -34,6 +32,6 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
 #[tokio::main]
 async fn main() {}
 
-pub async fn hash_file(path: &Path) -> Result<Hash, std::io::Error> {
+pub async fn hash_file(_path: &Path) -> Result<Hash, std::io::Error> {
    todo!("hash the file")
 }
