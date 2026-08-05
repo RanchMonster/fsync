@@ -202,7 +202,7 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
 ///
 /// Returns [`Error::PeerRejected`] if the peer is not a known peer. Errors
 /// from the known peers lookup are propagated.
-async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
+pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let peer_id = peer_key_hash(connection)?;
    let is_known = ok_or_reject!(
