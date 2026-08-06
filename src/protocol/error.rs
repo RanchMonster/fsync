@@ -1,42 +1,36 @@
 use quinn::VarInt;
 use thiserror::Error;
-macro_rules! impl_from_quinn {
-   ($err:ty) => {
-      impl From<$err> for Error {
-         fn from(err: $err) -> Self {
-            Error::Quic(err.into())
-         }
-      }
-   };
+#[derive(Error, Debug)]
+pub enum QuicError {
+   #[error(transparent)]
+   Write(#[from] quinn::WriteError),
+   #[error(transparent)]
+   Read(#[from] quinn::ReadError),
+   #[error(transparent)]
+   Connection(#[from] quinn::ConnectionError),
+   #[error(transparent)]
+   ReadExact(#[from] quinn::ReadExactError),
+   #[error(transparent)]
+   SendDatagram(#[from] quinn::SendDatagramError),
 }
+
 #[derive(Error, Debug)]
 pub enum Error {
-   #[error(
-      "Local add and discovery error please ensure you are not running another instance of fsync or that this device is capable of being discovered"
-   )]
-   Mdns(#[from] mdns_sd::Error),
-   /// Peer was rejected due to a reason
-   #[error("Peer was rejected due to {0}")]
+   #[error(transparent)]
+   Quic(QuicError),
+   #[error("Discovery error {0}")]
+   Discovery(String),
+   #[error("Peer rejected {0}")]
    PeerRejected(String),
-   /// Io error
-   #[error("IO error")]
-   Io(#[from] std::io::Error),
-   #[error("QUIC error {0}")]
-   Quic(Box<dyn std::error::Error + Send + Sync>),
-   #[error("Certificate error: {0}")]
-   Rcgen(#[from] rcgen::Error),
-   #[error("Parse data error: {0}")]
-   ParseData(String),
 }
-// The fact that quinn has this many error types is a bit of a pain and kind of annoying
-// Why do they not implement a Enum or at least a trait for this?
-// I will likely be submitting a PR to fix this at some point to quinn
-impl_from_quinn!(quinn::ConnectionError);
-impl_from_quinn!(quinn::SendDatagramError);
-impl_from_quinn!(quinn::ReadError);
-impl_from_quinn!(quinn::WriteError);
-impl_from_quinn!(quinn::ReadToEndError);
-impl_from_quinn!(quinn::ReadExactError);
+impl<T> From<T> for Error
+where
+   T: Into<QuicError>,
+{
+   fn from(err: T) -> Self {
+      Self::Quic(err.into())
+   }
+}
 #[repr(u32)]
 pub enum CloseCode {
    InvalidProtocol = 1,
@@ -51,4 +45,4 @@ impl Into<VarInt> for CloseCode {
       VarInt::from_u32(self as u32)
    }
 }
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
