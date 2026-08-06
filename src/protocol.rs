@@ -19,7 +19,6 @@ struct ServiceConfigArgs {
    pub address: Option<String>,
    pub port: Option<u16>,
    // this field is required
-   pub sync_dirs: Vec<String>,
    pub pair_mode: Option<PairMode>,
    pub hostname: Option<String>,
    // add more as needed
@@ -49,21 +48,24 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
    let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
 
    // configure the serve and attempt to locate peers on the network that we can talk to
-   let server_config = configure_server(&hostname)?;
+   let server_config = configure_server(&hostname).expect("Failed to configure server");
    let endpoint = Endpoint::server(
       server_config,
       format!("{address}:{port}")
          .parse()
          .expect("Invalid address or port"),
-   )?;
-   let local_addr = endpoint.local_addr()?;
+   )
+   .expect("Failed to create service endpoint");
+   let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
 
    tracing::debug!("Advertising {hostname}");
    // start the advertisement daemon
-   let advertise_daemon = advertise(local_addr, hostname).await?;
+   let advertise_daemon = advertise(local_addr, hostname).await;
    tracing::debug!("Looking for peers");
-   let browser = advertise_daemon.browse(SERVICE_TYPE)?;
+   let browser = advertise_daemon
+      .browse(SERVICE_TYPE)
+      .expect("Failed to browse for peers");
 
    // event loop for the service
    'service: loop {
@@ -71,7 +73,14 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
             accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
-            handle_incoming(incoming, &pair_mode).await?;
+            match handle_incoming(incoming, &pair_mode).await{
+                Ok(connection) => todo!("handle connection"),
+                Err(err) => match err {
+                    Error::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
+                    Error::Discovery(_) => unreachable!("Discovery error should not be possible here"),
+                    Error::PeerRejected(reason) => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
+                }
+            }
          }
          _event = browser.recv_async() => {
             todo!("handle events");
@@ -80,7 +89,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
    }
 }
 
-async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceDaemon> {
+async fn advertise(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
    assert!(!hostname.is_empty(), "Hostname cannot be empty");
    assert!(
       hostname.len() <= 15,
@@ -102,10 +111,12 @@ async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceD
       .enable_addr_auto();
       mdns.register(service_info)?;
 
-      Ok::<_, Error>(mdns)
+      Ok::<_, Box<dyn std::error::Error + Send + Sync>>(mdns)
    })
    .await;
-   let mdns = mdns.expect("Thread unexpectedly panicked")?;
+   let mdns = mdns
+      .expect("Thread unexpectedly panicked")
+      .expect("Failed to create mdns daemon");
 
-   Ok(mdns)
+   mdns
 }
