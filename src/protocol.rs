@@ -15,7 +15,7 @@ const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 
 // cleaner then a bunch of arguments
-struct ServiceConfigArgs {
+pub struct ServiceConfigArgs {
    pub address: Option<String>,
    pub port: Option<u16>,
    // this field is required
