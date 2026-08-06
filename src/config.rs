@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::fs::write;
+use std::io::Write;
 
 use crate::CONFIG_DIR;
 
@@ -10,12 +10,12 @@ pub fn create_config_file() {
 
    let mut file = File::create(config_file_path).expect("Failed to create config file");
 
-   write_default_config();
+   write_default_config(&mut file);
 }
 
 /// Writes the default config to the config file
 /// Precondition: Config file exists
-fn write_default_config() {
+fn write_default_config(config_file: &mut File) {
    let default_config = r#"
         # The address to listen on
         address = "0.0.0.0"
@@ -29,12 +29,7 @@ fn write_default_config() {
         hostname = "fsync"
     "#;
 
-   let mut config_file_path = CONFIG_DIR.clone();
-   config_file_path.push("config.toml");
-
-   assert!(config_file_path.exists(), "Config file does not exist");
-
-   let result = write(config_file_path, default_config);
+   let result = config_file.write(default_config.as_bytes());
 
    if let Err(error) = result {
       match error.kind() {
