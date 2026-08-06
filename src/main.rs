@@ -2,6 +2,8 @@ use blake3::Hash;
 mod fs_watcher;
 mod protocol;
 
+#[cfg(test)]
+use std::env::temp_dir;
 use std::{
    fs::create_dir_all,
    path::{Path, PathBuf},
