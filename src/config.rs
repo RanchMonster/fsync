@@ -1,6 +1,17 @@
+use std::fs::File;
 use std::fs::write;
 
 use crate::CONFIG_DIR;
+
+pub fn create_config_file() {
+   let config_file_path = CONFIG_DIR.join("config.talm");
+
+   assert!(!config_file_path.exists());
+
+   let mut file = File::create(config_file_path).expect("Failed to create config file");
+
+   write_default_config();
+}
 
 /// Writes the default config to the config file
 /// Precondition: Config file exists
