@@ -92,7 +92,7 @@ impl Display for KnownPeer {
 /// # Panics
 ///
 /// Panics if the file exists but cannot be opened, or if more than ten
-/// lines are empty or unreadable.
+/// lines are empty, unparseable, or unreadable.
 #[instrument]
 pub fn is_known_peers(key_hash: &[u8; 32]) -> bool {
    use ErrorKind::NotFound;
@@ -117,6 +117,13 @@ pub fn is_known_peers(key_hash: &[u8; 32]) -> bool {
          fail_count += 1;
          continue;
       };
+      let Ok(peer) = KnownPeer::from_str(&line) else {
+         fail_count += 1;
+         continue;
+      };
+      if peer.0 == *key_hash {
+         return true;
+      }
    }
    false
 }
@@ -268,7 +275,10 @@ async fn pair_client_side(connection: &mut Connection) {
       .expect("Peer didn't open a bidirectional stream for pairing.\nThis is possibly a bug please submit a issue if you believe this is a bug");
 
    let mut mode_len = [0; 1];
-   channel_rx.read_exact(&mut mode_len).await;
+   channel_rx
+      .read_exact(&mut mode_len)
+      .await
+      .expect("Peer didn't respond to pairing request");
    let mut mode_buf = vec![0; mode_len[0] as usize];
    channel_rx
       .read_exact(&mut mode_buf)
@@ -578,6 +588,7 @@ mod tests {
    use tokio::task::JoinSet;
 
    const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
+   static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
    #[test]
    fn test_known_peer_comparison() {
@@ -586,6 +597,36 @@ mod tests {
       let hexed_key = hex::encode(random_key);
       let prased_key = KnownPeer::from_str(&hexed_key).expect("failed to parse known peer");
       assert_eq!(peer, prased_key);
+   }
+
+   #[test]
+   fn test_is_known_peers_found() {
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let known_key = random::<[u8; 32]>();
+      let other_key = random::<[u8; 32]>();
+      let path = CONFIG_DIR.join("known_peers");
+      let contents = format!(
+         "{}\n\n{}\n{}\n",
+         KnownPeer(other_key),
+         "not-a-valid-hex-line",
+         KnownPeer(known_key)
+      );
+      std::fs::write(&path, contents).expect("failed to write known peers file");
+      assert!(is_known_peers(&known_key));
+      assert!(is_known_peers(&other_key));
+      assert!(!is_known_peers(&random::<[u8; 32]>()));
+      let _ = std::fs::remove_file(&path);
+   }
+
+   #[test]
+   fn test_is_known_peers_missing_file() {
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
+      assert!(!is_known_peers(&random::<[u8; 32]>()));
    }
 
    async fn connecting_peer(connect_attempt: Connecting) {
@@ -608,6 +649,9 @@ mod tests {
    #[tokio::test]
    async fn test_pair_peer_relaxed() {
       use quinn::Endpoint;
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
       // generate key and cert for virtual peers
       let server_config =
          mtls::configure_server("test-peer-server").expect("failed to configure server crypto");

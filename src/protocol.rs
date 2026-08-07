@@ -44,18 +44,30 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
       "Hostname cannot be longer than 15 characters"
    );
    let address = config_args.address.unwrap_or_else(|| "0.0.0.0".to_string());
-   let port = config_args.port.unwrap_or(DEFAULT_PORT);
+   let explicit_port = config_args.port;
+   let port = explicit_port.unwrap_or(DEFAULT_PORT);
    let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname).expect("Failed to configure server");
-   let endpoint = Endpoint::server(
-      server_config,
-      format!("{address}:{port}")
-         .parse()
-         .expect("Invalid address or port"),
-   )
-   .expect("Failed to create service endpoint");
+   let socket_addr = format!("{address}:{port}")
+      .parse()
+      .expect("Invalid address or port");
+   let endpoint = match Endpoint::server(server_config.clone(), socket_addr) {
+      Ok(endpoint) => endpoint,
+      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && explicit_port.is_none() => {
+         tracing::warn!("Default port {port} is in use, using a random free port instead");
+         let fallback_addr = format!("{address}:0")
+            .parse()
+            .expect("Invalid address or port");
+         Endpoint::server(server_config, fallback_addr)
+            .expect("Failed to create service endpoint on a random free port")
+      }
+      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+         panic!("Port {port} is in use, set a different port: {err}");
+      }
+      Err(err) => panic!("Failed to create service endpoint on {address}:{port}: {err}"),
+   };
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
 
@@ -73,8 +85,8 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
             accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
-            match handle_incoming(incoming, &pair_mode).await{
-                Ok(connection) => todo!("handle connection"),
+            match handle_incoming(incoming, &pair_mode).await {
+                Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
                 Err(err) => match err {
                     Error::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
                     Error::Discovery(_) => unreachable!("Discovery error should not be possible here"),
