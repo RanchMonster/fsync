@@ -73,9 +73,9 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
 
    tracing::debug!("Advertising {hostname}");
    // start the advertisement daemon
-   let advertise_daemon = advertise(local_addr, hostname).await;
+   let advertising_daemon = advertise(local_addr, hostname).await;
    tracing::debug!("Looking for peers");
-   let browser = advertise_daemon
+   let browser = advertising_daemon
       .browse(SERVICE_TYPE)
       .expect("Failed to browse for peers");
 
