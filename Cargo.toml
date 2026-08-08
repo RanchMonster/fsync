@@ -16,7 +16,9 @@ quinn = "0.11.11"
 rand = "0.10.2"
 rcgen = "0.14.8"
 rustls = { version = "0.23.43", default-features = false, features = ["logging", "ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml = "1.1.4"
 tracing = "0.1.44"
 x509-parser = "0.18.1"
