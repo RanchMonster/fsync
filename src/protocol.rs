@@ -108,8 +108,8 @@ async fn advertise(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
       hostname.len() <= 15,
       "Hostname cannot be longer than 15 characters"
    );
-   let mdns = task::spawn_blocking(move || {
-      let mdns = ServiceDaemon::new().expect("Failed to create mdns daemon");
+   let service_daemon = task::spawn_blocking(move || {
+      let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
       // load the address from the environment variable or default to auto assigned
       let address = socket_adrr.ip().to_string();
       let port = socket_adrr.port();
@@ -122,14 +122,13 @@ async fn advertise(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
          [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
       )?
       .enable_addr_auto();
-      mdns.register(service_info)?;
+      service_daemon.register(service_info)?;
 
-      Ok::<_, Box<dyn std::error::Error + Send + Sync>>(mdns)
+      Ok::<_, Box<dyn std::error::Error + Send + Sync>>(service_daemon)
    })
-   .await;
-   let mdns = mdns
-      .expect("Thread unexpectedly panicked")
-      .expect("Failed to create mdns daemon");
+   .await
+   .expect("Thread unexpectedly panicked")
+   .expect("Failed to create mdns service daemon");
 
-   mdns
+   service_daemon
 }
