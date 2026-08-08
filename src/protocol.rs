@@ -44,8 +44,8 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
       "Hostname cannot be longer than 15 characters"
    );
    let address = config_args.address.unwrap_or_else(|| "0.0.0.0".to_string());
-   let explicit_port = config_args.port;
-   let port = explicit_port.unwrap_or(DEFAULT_PORT);
+   let config_port = config_args.port;
+   let port = config_port.unwrap_or(DEFAULT_PORT);
    let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
 
    // configure the serve and attempt to locate peers on the network that we can talk to
@@ -55,18 +55,27 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
       .expect("Invalid address or port");
    let endpoint = match Endpoint::server(server_config.clone(), socket_addr) {
       Ok(endpoint) => endpoint,
+
+      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && config_port.is_none() => {
+         tracing::warn!("Default port {port} is in use, using a random free port instead");
+         let fallback_addr = format!("{address}:0")
+            .parse()
+            .expect("Invalid address or port");
+         Endpoint::server(server_config, fallback_addr)
+            .expect("Failed to create service endpoint on a random free port")
+      }
       Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-         if  explicit_port.is_none() {
-           tracing::warn!("Default port {port} is in use, using a random free port instead");
-           let fallback_addr = format!("{address}:0")
-              .parse()
-              .expect("Invalid address or port");
-           Endpoint::server(server_config, fallback_addr)
-              .expect("Failed to create service endpoint on a random free port")
-        } else {
-           panic!("Port {port} is in use, set a different port: {err}");
-       }
-   }
+         if config_port.is_none() {
+            tracing::warn!("Default port {port} is in use, using a random free port instead");
+            let fallback_addr = format!("{address}:0")
+               .parse()
+               .expect("Invalid address or port");
+            Endpoint::server(server_config, fallback_addr)
+               .expect("Failed to create service endpoint on a random free port")
+         } else {
+            panic!("Port {port} is in use, set a different port: {err}");
+         }
+      }
       Err(err) => panic!("Failed to create service endpoint on {address}:{port}: {err}"),
    };
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
@@ -74,7 +83,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
 
    tracing::debug!("Advertising {hostname}");
    // start the advertisement daemon
-   let advertising_daemon = advertise(local_addr, hostname).await;
+   let advertising_daemon = advertise_local_client(local_addr, hostname).await;
    tracing::debug!("Looking for peers");
    let browser = advertising_daemon
       .browse(SERVICE_TYPE)
@@ -103,7 +112,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
    }
 }
 
-async fn advertise(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
+async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
    assert!(!hostname.is_empty(), "Hostname cannot be empty");
    assert!(
       hostname.len() <= 15,
