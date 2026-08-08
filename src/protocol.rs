@@ -89,8 +89,8 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
                 Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
                 Err(err) => match err {
                     Error::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
-                    Error::Discovery(_) => unreachable!("Discovery error should not be possible here"),
                     Error::PeerRejected(reason) => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
+                    Error::Discovery(_) => unreachable!("Discovery error should not be possible here"),
                 }
             }
          }
