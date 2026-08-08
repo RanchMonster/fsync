@@ -19,7 +19,7 @@ use quinn::{Connection, Incoming, Side};
 use rand::random;
 use std::{
    fmt::Display,
-   fs::File,
+   fs::{self, File},
    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
    str::FromStr,
    sync::Arc,
@@ -94,31 +94,33 @@ impl Display for KnownPeer {
 /// Panics if the file exists but cannot be opened, or if more than ten
 /// lines are empty, unparseable, or unreadable.
 #[instrument]
-pub fn is_known_peers(key_hash: &[u8; 32]) -> bool {
+pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
    use ErrorKind::NotFound;
    let path = CONFIG_DIR.join("known_peers");
-   let file = match std::fs::File::open(&path) {
+   let file = match File::open(&path) {
       Ok(file) => file,
       Err(err) if err.kind() == NotFound => return false,
       Err(err) => {
          panic!("Failed to open known peers file {path:?}: {err}");
       }
    };
-   let mut fail_count = 0;
-   for line in BufReader::new(file).lines() {
-      if fail_count > 10 {
+   // number of faulty lines in the file breaks after 10
+   let known_peers_file = BufReader::new(file);
+   let mut bad_line_count = 0;
+   for line in known_peers_file.lines() {
+      if bad_line_count > 10 {
          panic!("Known peers file {path:?} is corrupted");
       }
       let Ok(line) = line else {
-         fail_count += 1;
+         bad_line_count += 1;
          continue;
       };
       if line.is_empty() {
-         fail_count += 1;
+         bad_line_count += 1;
          continue;
       };
       let Ok(peer) = KnownPeer::from_str(&line) else {
-         fail_count += 1;
+         bad_line_count += 1;
          continue;
       };
       if peer.0 == *key_hash {
@@ -167,7 +169,7 @@ impl Default for PairMode {
 /// already present.
 #[instrument]
 fn add_known_peer(peer: KnownPeer) {
-   if is_known_peers(&peer.0) {
+   if is_known_peer(&peer.0) {
       return;
    }
    let result: Result<(), std::io::Error> = (|| {
@@ -231,7 +233,7 @@ pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use Error::PeerRejected;
    let peer_id = peer_key_hash(connection)?;
    let is_known = ok_or_reject!(
-      task::spawn_blocking(move || is_known_peers(&peer_id)).await,
+      task::spawn_blocking(move || is_known_peer(&peer_id)).await,
       "failed to check known peers"
    );
    if !is_known {
@@ -614,9 +616,9 @@ mod tests {
          KnownPeer(known_key)
       );
       std::fs::write(&path, contents).expect("failed to write known peers file");
-      assert!(is_known_peers(&known_key));
-      assert!(is_known_peers(&other_key));
-      assert!(!is_known_peers(&random::<[u8; 32]>()));
+      assert!(is_known_peer(&known_key));
+      assert!(is_known_peer(&other_key));
+      assert!(!is_known_peer(&random::<[u8; 32]>()));
       let _ = std::fs::remove_file(&path);
    }
 
@@ -626,7 +628,7 @@ mod tests {
          .lock()
          .unwrap_or_else(|poisoned| poisoned.into_inner());
       let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
-      assert!(!is_known_peers(&random::<[u8; 32]>()));
+      assert!(!is_known_peer(&random::<[u8; 32]>()));
    }
 
    async fn connecting_peer(connect_attempt: Connecting) {
