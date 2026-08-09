@@ -48,7 +48,7 @@ pub struct ConfigIntermediary {
 }
 
 pub fn create_config_file() {
-   let config_file_path = CONFIG_DIR.join("config.talm");
+   let config_file_path = CONFIG_DIR.join("config.toml");
 
    assert!(!config_file_path.exists());
 
@@ -116,7 +116,7 @@ fn write_default_config(config_file: &mut File) {
 }
 
 fn read_config_file() -> ConfigIntermediary {
-   let config_file_path = CONFIG_DIR.join("config.talm");
+   let config_file_path = CONFIG_DIR.join("config.toml");
 
    let mut config_file = File::open(config_file_path).expect("Failed to open config file");
 
