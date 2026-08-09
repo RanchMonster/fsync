@@ -100,7 +100,7 @@ fn write_default_config(config_file: &mut File) {
         # The hostname to advertise
         hostname = "fsync"
         # The password to use for password pairing, only used if pair_mode is password
-        password = "password"
+        # password = 
     "#;
 
    let result = config_file.write(default_config.as_bytes());
