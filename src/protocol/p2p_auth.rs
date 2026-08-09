@@ -264,19 +264,21 @@ fn prompt_user(prompt: &str) -> Result<String, std::io::Error> {
 /// Panics on any failure: a stream or pairing exchange error, an unknown
 /// pair mode, an invalid pairing key, a rejected pairing, or an unexpected
 /// response from the server.
-#[instrument(skip(connection))]
-async fn pair_client_side(connection: &mut Connection) {
-   let (mut channel_tx, mut channel_rx) = connection
-      .accept_bi()
-      .await
-      .expect("Peer didn't open a bidirectional stream for pairing.\nThis is possibly a bug please submit a issue if you believe this is a bug");
-   // A simple helper function to check if the peer has accepted the pairing
-   async fn accepted() -> bool {
-      assert_eq!(
-         AuthCommands::ACCEPT.len(),
-         AuthCommands::REJECT.len(),
-         "the pairing response must both be the same length"
-      );
+async fn pair_client_side(connection: &mut Connection) -> Result<()> {
+   assert_eq!(
+      AuthCommands::ACCEPT.len(),
+      AuthCommands::REJECT.len(),
+      "the pairing response must both be the same length"
+   );
+   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+
+   // I don't like doing this before completing the pairing but it made it easier to deal with lifetimes
+   let peer_id = peer_key_hash(connection)?;
+
+   /// A simple helper function to check if the peer has accepted the pairing
+   async fn accepted(
+      channel_tx: &mut quinn::SendStream, channel_rx: &mut quinn::RecvStream, peer_id: [u8; 32],
+   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
       let mut response = [0; AuthCommands::ACCEPT.len()]; // more than enough for the pairing response just arbitrarily chose
       channel_rx
       .read_exact(&mut response)
@@ -284,18 +286,22 @@ async fn pair_client_side(connection: &mut Connection) {
       .expect("Received invalid pairing response.\nThis is possibly a bug please submit a issue if you believe this is a bug");
 
       if response == AuthCommands::ACCEPT {
-         let peer_id = peer_key_hash(connection).expect("Failed to get peer key hash");
          task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
             .await
-            .expect("Failed to register peer");
-         true
+            .expect("Thread panicked unexpectedly")
+            .expect("Failed to add peer to known peers list");
+         Ok(())
       } else if response == AuthCommands::REJECT {
-         false
+         Err("Pairing rejected by peer".into())
       } else {
          let lossy_response = String::from_utf8_lossy(&response);
-         false
+         Err(format!(
+            "unexpected pairing response: {lossy_response}\nThis is possibly a bug please submit a issue if you believe this is a bug"
+         )
+         .into())
       }
    }
+
    let mut mode_len = [0; 1];
    channel_rx
       .read_exact(&mut mode_len)
@@ -306,7 +312,9 @@ async fn pair_client_side(connection: &mut Connection) {
       .read_exact(&mut mode_buf)
       .await
       .expect("Peer didn't respond to pairing request");
-   let mode_str = std::str::from_utf8(&mode_buf).expect("pair mode is not valid utf-8");
+   let mode_str = std::str::from_utf8(&mode_buf)
+      .expect("Pair mode is not valid utf-8 string this is likely a bug or a malicious peer");
+
    match mode_str {
       "RELAXED" => {}
 
@@ -354,7 +362,6 @@ async fn pair_client_side(connection: &mut Connection) {
 
 /// Server side of the pairing exchange: announces the configured pair mode,
 /// validates the client's response, and records the peer as known on success.
-#[instrument(skip(connection))]
 async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
    use Error::PeerRejected;
    use PairMode::*;
