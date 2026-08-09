@@ -1,19 +1,26 @@
 use std::fs::File;
-use std::io::Write;
-use std::sync::Arc;
+use std::io::{Read, Write};
+use std::sync::{Arc, LazyLock};
 
 use argon2::password_hash::PasswordHashString;
-use serde::Serialize;
+use serde::Deserialize;
 
 use crate::CONFIG_DIR;
 use crate::protocol::{PairMode, ServiceConfigArgs};
 
-const DEFAULT_PORT: u16 = 43127;
-const DEFAULT_PAIR_MODE: PairMode = PairMode::Relaxed;
-const DEFAULT_ADDRESS: &str = "0.0.0.0";
+const fn default_port() -> u16 {
+   43127
+}
 
-#[allow(non_snake_case)]
-fn GET_DEFAULT_HOSTNAME() -> String {
+fn default_pair_mode() -> String {
+   "RELAXED".to_string()
+}
+
+fn default_address() -> String {
+   "0.0.0.0".to_string()
+}
+
+fn default_hostname() -> String {
    let mut name = hostname::get()
       .expect("Failed to get hostname")
       .to_string_lossy()
@@ -25,14 +32,19 @@ fn GET_DEFAULT_HOSTNAME() -> String {
    name
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct ConfigIntermediary {
-   pub address: Option<String>,
-   pub port: Option<u16>,
-   pub sync_dirs: Option<Vec<String>>,
-   pub pair_mode: Option<String>,
-   pub hostname: Option<String>,
+   #[serde(default = "default_port")]
+   pub port: u16,
+   #[serde(default = "default_address")]
+   pub address: String,
+   #[serde(default = "default_pair_mode")]
+   pub pair_mode: String,
+   #[serde(default = "default_hostname")]
+   pub hostname: String,
+
    pub password: Option<String>,
+   pub sync_dirs: Option<Vec<String>>,
 }
 
 pub fn create_config_file() {
@@ -47,8 +59,7 @@ pub fn create_config_file() {
 
 impl Into<ServiceConfigArgs> for ConfigIntermediary {
    fn into(self) -> ServiceConfigArgs {
-      let pair_mode = self.pair_mode.unwrap_or("RELAXED".to_string());
-      let pair_mode = match pair_mode.as_str() {
+      let pair_mode = match self.pair_mode.as_str() {
          "STRICT" => PairMode::Strict,
          "RELAXED" => PairMode::Relaxed,
          "PASSWORD" => PairMode::Password(Arc::new(
@@ -65,11 +76,11 @@ impl Into<ServiceConfigArgs> for ConfigIntermediary {
       };
 
       ServiceConfigArgs {
-         address: self.address.unwrap_or(DEFAULT_ADDRESS.to_string()),
-         port: self.port.unwrap_or(DEFAULT_PORT),
+         address: self.address,
+         port: self.port,
          sync_dirs: self.sync_dirs.expect("Sync dirs are required"),
          pair_mode: pair_mode,
-         hostname: self.hostname.unwrap_or_else(GET_DEFAULT_HOSTNAME),
+         hostname: self.hostname,
       }
    }
 }
@@ -102,4 +113,17 @@ fn write_default_config(config_file: &mut File) {
          panic!("Failed to write config file: {error}");
       }
    }
+}
+
+fn read_config_file() -> ConfigIntermediary {
+   let config_file_path = CONFIG_DIR.join("config.talm");
+
+   let mut config_file = File::open(config_file_path).expect("Failed to open config file");
+
+   let mut config_contents = String::new();
+   config_file
+      .read_to_string(&mut config_contents)
+      .expect("Failed to read config file");
+
+   toml::from_str(&config_contents).expect("Failed to read config file")
 }
