@@ -25,7 +25,7 @@ struct ServiceConfigArgs {
    // once we have figured out a config and put stuff togother more we will need to add this
    // sync_dirs: todo!("whatever we use to represent sync dirs"),
 }
-async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
+async fn start_service(config_args: ServiceConfigArgs) -> ! {
    // load args from the config given
    let hostname = config_args.hostname.unwrap_or_else(|| {
       let mut name = hostname::get()
