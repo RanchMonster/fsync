@@ -92,7 +92,7 @@ fn write_default_config(config_file: &mut File) {
         # The address to listen on
         address = "0.0.0.0"
         # The port to listen on
-        port = 6969
+        port = 43127
         # The directories to sync (List of strings)
         sync_dirs = []
         # The pairing mode to use (relaxed, strict, password, keyonly)
