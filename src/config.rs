@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use argon2::password_hash::PasswordHashString;
 use serde::Deserialize;
