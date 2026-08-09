@@ -62,15 +62,24 @@ impl Into<ServiceConfigArgs> for ConfigIntermediary {
       let pair_mode = match self.pair_mode.as_str() {
          "STRICT" => PairMode::Strict,
          "RELAXED" => PairMode::Relaxed,
-         "PASSWORD" => PairMode::Password(Arc::new(
-            PasswordHashString::new(
-               self
-                  .password
-                  .expect("Password is required for password pairing")
-                  .as_str(),
-            )
-            .expect("Failed to create password hash"),
-         )),
+         "PASSWORD" => {
+            let password = self
+               .password
+               .expect("Password is required for password pairing");
+            // Accept either a PHC hash string or a plain password.
+            let hash = PasswordHashString::new(password.as_str()).unwrap_or_else(|_| {
+               let salt = argon2::password_hash::SaltString::generate(&mut rand_core::OsRng);
+               let phc = argon2::password_hash::PasswordHasher::hash_password(
+                  &argon2::Argon2::default(),
+                  password.as_bytes(),
+                  &salt,
+               )
+               .expect("Failed to hash password")
+               .to_string();
+               PasswordHashString::new(&phc).expect("Failed to create password hash")
+            });
+            PairMode::Password(Arc::new(hash))
+         },
          "KEYONLY" => PairMode::KeyOnly,
          other => panic!("Unknown pair mode: {other}"),
       };
