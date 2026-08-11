@@ -21,44 +21,102 @@ use rand::random;
 use std::{
    fmt::Display,
    fs::{self, File},
-   io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
+   io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
    str::FromStr,
    sync::Arc,
    time::Duration,
 };
-use tokio::{task, time::timeout};
+use thiserror::Error;
+use tokio::{
+   task::{self, JoinError},
+   time::timeout,
+};
 use tracing::instrument;
 use x509_parser::nom::AsBytes;
+
+use super::error::CloseCode;
+use crate::{CONFIG_DIR, protocol::error::QuicError};
+
 mod mtls;
-use super::error::{CloseCode, Error, Result};
-use crate::CONFIG_DIR;
 /// Re-exports the mTLS server config builder from the `mtls` submodule.
 pub use mtls::configure_server;
-use std::io::ErrorKind;
-
 const MAX_PASSWORD_ATTEMPTS: u32 = 5;
 const MAX_PASSWORD_LENGTH: usize = 256;
 
-/// A macro to unwrap a `Result`, returning an [`Error::PeerRejected`] with
-/// the given message on error.
+/// A macro to unwrap a `Result`, returning an [`AuthError`] converted into the
+/// parent error type on error.
 macro_rules! ok_or_reject {
-   ($e:expr,$msg:expr) => {
+   ($e:expr,$err:expr) => {
       match $e {
          Ok(x) => x,
-         Err(_) => return Err(Error::PeerRejected($msg.to_string())),
+         Err(_) => return Err($err.into()),
       }
    };
 }
-/// Unwraps an `Option` value, returning an [`Error::PeerRejected`] with the
-/// given message on `None`.
+
+/// Unwraps an `Option` value, returning an [`AuthError`] converted into the
+/// parent error type on `None`.
 macro_rules! some_or_reject {
-   ($e:expr,$msg:expr) => {
+   ($e:expr,$err:expr) => {
       match $e {
          Some(x) => x,
-         None => return Err(Error::PeerRejected($msg.to_string())),
+         None => return Err($err.into()),
       }
    };
 }
+
+/// Errors that can occur during peer authentication and pairing.
+#[derive(Error, Debug)]
+pub enum AuthError {
+   #[error("no peer identity")]
+   NoPeerIdentity,
+   #[error("peer identity is not a valid certificate(s)")]
+   InvalidPeerIdentity,
+   #[error("failed to check known peers")]
+   KnownPeersCheckFailed,
+   #[error("peer is not a known peer")]
+   UnknownPeer,
+   #[error("Received invalid pairing mode from peer")]
+   InvalidPairMode,
+   #[error("failed to verify password")]
+   PasswordVerificationFailure,
+   #[error("Key only mode does not allow pairing")]
+   PairingNotAllowed,
+   #[error("Password must be at least 1 character long")]
+   EmptyPassword,
+   #[error("Password rejected")]
+   PasswordRejected,
+   #[error("Key mismatch")]
+   KeyMismatch,
+   #[error("failed to register peer: {0}")]
+   FailedToRegisterPeer(#[source] JoinError),
+   #[error("peer connection timed out")]
+   PeerTimeout,
+   #[error("handshake timed out")]
+   HandshakeTimeout,
+   #[error("invalid auth handshake data")]
+   InvalidAuthData,
+   #[error("Too many password attempts")]
+   TooManyPasswordAttempts,
+   #[error("Too many pairing key attempts")]
+   TooManyKeyAttempts,
+   #[error("invalid pairing key: {0}")]
+   InvalidPairingKey(#[source] hex::FromHexError),
+   #[error(transparent)]
+   Quic(QuicError),
+}
+
+/// Simple wrapper to handle for all QUIC errors.
+impl<T> From<T> for AuthError
+where
+   T: Into<QuicError>,
+{
+   fn from(err: T) -> Self {
+      Self::Quic(err.into())
+   }
+}
+/// Define the result type for this module.
+type Result<T, E = AuthError> = std::result::Result<T, E>;
 
 // I hate handling it like this but rust won't let me do it with a Enum
 /// The set of wire-level commands exchanged during the authentication and
@@ -72,6 +130,7 @@ impl AuthCommands {
    const ACCEPT: &[u8] = b"ACCEPT";
    const PAIR: &[u8] = b"PAIR";
 }
+
 /// A peer identity: the blake3 hash of a peer certificate's public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct KnownPeer([u8; 32]);
@@ -85,11 +144,13 @@ impl FromStr for KnownPeer {
       Ok(KnownPeer(key_hash))
    }
 }
+
 impl Display for KnownPeer {
    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       write!(f, "{}", hex::encode(self.0))
    }
 }
+
 /// Checks whether the given key hash is present in the known peers list
 /// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
 /// list, so this returns `false` rather than panicking.
@@ -134,6 +195,7 @@ pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
    }
    false
 }
+
 /// Represents the pairing mode of this device: how the server side handles a
 /// `PAIR` request from an unknown peer. The `Display` form of the mode is what
 /// is announced to the pairing client over the wire. The default is
@@ -170,6 +232,7 @@ impl Default for PairMode {
       Self::Relaxed
    }
 }
+
 /// Records the given peer in the known peers list, appending it if it is not
 /// already present.
 fn add_known_peer(peer: KnownPeer) -> Result<(), std::io::Error> {
@@ -192,51 +255,50 @@ fn add_known_peer(peer: KnownPeer) -> Result<(), std::io::Error> {
    writeln!(file, "{}", peer)?;
    Ok(())
 }
+
 /// Extracts the blake3 hash of the peer certificate's public key, used to
 /// identify the peer in the known peers list.
 ///
 /// # Errors
 ///
-/// Returns [`Error::PeerRejected`] if the connection has no peer identity or
-/// the identity is not a valid certificate chain.
+/// Returns [`AuthError`] if the connection has no peer identity or the
+/// identity is not a valid certificate chain.
 #[instrument(skip(connection))]
 fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
-   let identity = some_or_reject!(connection.peer_identity(), "no peer identity");
+   use AuthError::{InvalidPeerIdentity, NoPeerIdentity};
+   let identity = some_or_reject!(connection.peer_identity(), NoPeerIdentity);
 
    let tls_handshake_data = ok_or_reject!(
       identity.downcast::<Vec<rustls::pki_types::CertificateDer>>(),
-      "peer identity is not a valid certificate(s)"
+      InvalidPeerIdentity
    );
 
-   let peer_cert = some_or_reject!(
-      tls_handshake_data.first(),
-      "peer identity is not a valid certificate(s)"
-   );
+   let peer_cert = some_or_reject!(tls_handshake_data.first(), InvalidPeerIdentity);
 
    let (_, x509_cert) = ok_or_reject!(
       x509_parser::parse_x509_certificate(peer_cert),
-      "peer identity is not a valid certificate"
+      InvalidPeerIdentity
    );
 
    let public_key = x509_cert.public_key().raw;
    Ok(*blake3::hash(public_key).as_bytes())
 }
+
 /// Authenticates a peer that claims to be known to us by checking its key
 /// hash against the known peers list.
 ///
 /// # Errors
 ///
-/// Returns [`Error::PeerRejected`] if the peer is not a known peer.
-///
+/// Returns [`AuthError`] if the peer is not a known peer.
 pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
-   use Error::PeerRejected;
+   use AuthError::{KnownPeersCheckFailed, UnknownPeer};
    let peer_id = peer_key_hash(connection)?;
    let is_known = ok_or_reject!(
       task::spawn_blocking(move || is_known_peer(&peer_id)).await,
-      "failed to check known peers"
+      KnownPeersCheckFailed
    );
    if !is_known {
-      return Err(PeerRejected("peer is not a known peer".to_string()));
+      return Err(UnknownPeer.into());
    }
    Ok(())
 }
@@ -262,16 +324,23 @@ async fn prompt_user(prompt: &'static str) -> Result<String, std::io::Error> {
 }
 
 /// Client side of the pairing exchange: reads the pair mode announced by the
-/// server and provides the requested credentials, then records the peer as
-/// known on a successful exchange.
-/// NOTE: this function is cli only and after this function completes execution should never return
+/// server and provides the requested credentials. The peer is recorded as
+/// known on the server side of the exchange, not here.
+///
+/// # Errors
+///
+/// Returns [`AuthError`] if the pairing key or password is rejected, the
+/// input is invalid, or the maximum number of attempts is exceeded, and
+/// [`QuicError`] if the pairing stream fails.
 ///
 /// # Panics
 ///
-/// Panics on any failure: a stream or pairing exchange error, an unknown
-/// pair mode, an invalid pairing key, a rejected pairing, or an unexpected
-/// response from the server.
+/// Panics if the server announces an unknown pair mode, or if reading input
+/// from the user fails.
 async fn pair_client_side(connection: &mut Connection) -> Result<()> {
+   use AuthError::{
+      InvalidPairMode, InvalidPairingKey, TooManyKeyAttempts, TooManyPasswordAttempts,
+   };
    assert_eq!(
       AuthCommands::ACCEPT.len(),
       AuthCommands::REJECT.len(),
@@ -305,10 +374,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
    channel_rx.read_exact(&mut mode_len).await?;
    let mut mode_buf = vec![0; mode_len[0] as usize];
    channel_rx.read_exact(&mut mode_buf).await?;
-   let mode_str = ok_or_reject!(
-      std::str::from_utf8(&mode_buf),
-      "Received invalid pairing mode from peer"
-   );
+   let mode_str = ok_or_reject!(std::str::from_utf8(&mode_buf), InvalidPairMode);
    match mode_str {
       "RELAXED" => {}
 
@@ -316,7 +382,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          let mut password_attempts = 0;
          loop {
             if password_attempts >= MAX_PASSWORD_ATTEMPTS {
-               todo!("Create auth error type and use it here");
+               return Err(TooManyPasswordAttempts.into());
             }
             let password = prompt_user("Password: ")
                .await
@@ -342,7 +408,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          let mut key_attempts = 0;
          loop {
             if key_attempts >= MAX_PASSWORD_ATTEMPTS {
-               todo!("Create auth error type and use it here");
+               return Err(TooManyKeyAttempts.into());
             }
             let key_hex = prompt_user("Enter the pairing key: ")
                .await
@@ -351,8 +417,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
                .chars()
                .filter(|c| *c != '-')
                .collect::<String>();
-            let key = decoed_pairing_key(&key_hex)
-               .expect("TODO: create auth error type and use that instead");
+            let key = decoed_pairing_key(&key_hex).map_err(InvalidPairingKey)?;
             channel_tx.write_all(&key).await?;
             if accepted(&mut channel_rx).await? {
                break;
@@ -363,11 +428,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
 
       "KEYONLY" => {}
 
-      other => {
-         panic!(
-            "unknown pair mode: {other}\nThis is possibly a bug please submit a issue if you believe this is a bug"
-         );
-      }
+      _ => return Err(InvalidPairMode),
    }
 
    Ok(())
@@ -375,8 +436,16 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
 
 /// Server side of the pairing exchange: announces the configured pair mode,
 /// validates the client's response, and records the peer as known on success.
+///
+/// # Errors
+///
+/// Returns [`AuthError`] if the pairing is rejected, and [`QuicError`] for
+/// stream or connection failures.
 async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
-   use Error::PeerRejected;
+   use AuthError::{
+      EmptyPassword, FailedToRegisterPeer, KeyMismatch, PairingNotAllowed, PasswordRejected,
+      PasswordVerificationFailure,
+   };
    use PairMode::*;
    let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
    let mode = pair_mode.to_string();
@@ -390,9 +459,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 
       KeyOnly => {
          channel_tx.write_all(AuthCommands::REJECT).await?;
-         return Err(PeerRejected(
-            "Key only mode does not allow pairing".to_string(),
-         ));
+         return Err(PairingNotAllowed.into());
       }
 
       Password(password) => {
@@ -403,9 +470,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
             .await?
             .unwrap_or_default();
          if read == 0 {
-            return Err(PeerRejected(
-               "Password must be at least 1 character long".to_string(),
-            ));
+            return Err(EmptyPassword.into());
          }
 
          let client_password = client_password[..read].to_vec();
@@ -417,11 +482,11 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
                   .is_ok()
             })
             .await,
-            "failed to verify password"
+            PasswordVerificationFailure
          );
          if !accept {
             channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(PeerRejected("Password rejected".to_string()));
+            return Err(PasswordRejected.into());
          }
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
       }
@@ -437,7 +502,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
          channel_rx.read_exact(&mut response_key).await?;
          if random_key != response_key {
             channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(PeerRejected("Key mismatch".to_string()));
+            return Err(KeyMismatch.into());
          }
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
       }
@@ -445,7 +510,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
    let peer_id = peer_key_hash(connection)?;
    task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
       .await
-      .map_err(|err| PeerRejected(format!("failed to register peer: {err}")))?;
+      .map_err(FailedToRegisterPeer)?;
    Ok(())
 }
 
@@ -454,7 +519,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 /// The exchange is driven by the connection's role: the client side reads the
 /// pair mode announced by the server and supplies the requested credentials,
 /// while the server side announces its configured [`PairMode`] and validates
-/// the client's response. Both sides record the peer in the known peers list
+/// the client's response. The server records the peer in the known peers list
 /// when the pairing succeeds.
 ///
 /// # Arguments
@@ -466,15 +531,16 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 ///
 /// # Errors
 ///
-/// On the server side, returns [`Error::PeerRejected`] when the pairing is
-/// rejected (for example `KeyOnly` mode, a password or key mismatch, or
-/// failing to record the peer) and [`Error::Quic`] for stream or connection
-/// failures.
+/// On the server side, returns [`AuthError`] when the pairing is rejected
+/// (for example `KeyOnly` mode, a password or key mismatch, or failing to
+/// record the peer) and [`QuicError`] for stream or connection failures.
+///
+/// On the client side the exchange's errors are not propagated; this function
+/// always returns `Ok`.
 ///
 /// # Panics
 ///
-/// On the client side the exchange panics on any failure instead of
-/// returning an error.
+/// Panics if the server side is used without a [`PairMode`].
 pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>) -> Result<()> {
    use Side::{Client, Server};
    match connection.side() {
@@ -491,6 +557,7 @@ pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>
       }
    }
 }
+
 /// Client side of the authenticated handshake: announces that we are a known
 /// peer and verifies that the server acknowledges us.
 ///
@@ -500,19 +567,18 @@ pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>
 ///
 /// # Errors
 ///
-/// Returns [`Error::PeerRejected`] if the peer is not a known peer or the
-/// server does not acknowledge the connection within the timeout.
+/// Returns [`AuthError`] if the peer is not a known peer or the server does
+/// not acknowledge the connection within the timeout.
 pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()> {
-   use Error::PeerRejected;
-   connection
-      .send_datagram(AuthCommands::INIT.into())
-      .map_err(Error::from)?;
+   use AuthError::PeerTimeout;
+   connection.send_datagram(AuthCommands::INIT.into())?;
    authenticate_peer(connection).await?;
    match timeout(Duration::from_secs(5), connection.read_datagram()).await {
       Ok(Ok(data)) if data.starts_with(AuthCommands::ACKNOWLEDGE) => Ok(()),
-      _ => Err(PeerRejected("peer connection timed out".to_string())),
+      _ => Err(PeerTimeout.into()),
    }
 }
+
 /// Client side of the pairing handshake: announces a pairing request and runs
 /// the exchange with the server.
 ///
@@ -521,16 +587,13 @@ pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()>
 ///
 /// # Errors
 ///
-/// Returns [`Error::Quic`] if the `PAIR` datagram cannot be sent. The pairing
-/// exchange itself never returns an error on the client side; failures such
-/// as a rejected pairing, an unknown pair mode, or an unexpected response
-/// panic in [`pair_peer`].
+/// Returns [`QuicError`] if the `PAIR` datagram cannot be sent, or
+/// [`AuthError`] if the pairing exchange fails on the client side.
 pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
-   connection
-      .send_datagram(AuthCommands::PAIR.into())
-      .map_err(Error::from)?;
+   connection.send_datagram(AuthCommands::PAIR.into())?;
    pair_peer(connection, None).await
 }
+
 /// Server side of the handshake: accepts an incoming QUIC connection and
 /// authenticates it.
 ///
@@ -547,13 +610,14 @@ pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
 ///
 /// # Errors
 ///
-/// Returns [`Error::PeerRejected`] if the peer is unknown, the handshake
-/// times out, the pairing is rejected, or an invalid command is received. On
-/// failure the connection is closed with [`CloseCode::AuthenticationFailure`].
+/// Returns [`AuthError`] if the peer is unknown, the handshake times out,
+/// the pairing is rejected, or an invalid command is received, and
+/// [`QuicError`] for stream or connection failures. On a handshake timeout
+/// the connection is closed with [`CloseCode::AuthenticationFailure`].
 #[instrument(skip(incoming, pair_mode))] // pair_mode doesn't matter here
 pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result<Connection> {
+   use AuthError::{HandshakeTimeout, InvalidAuthData};
    use CloseCode::AuthenticationFailure;
-   use Error::PeerRejected;
    let mut connection = incoming.await?;
    let handshake_packet = match timeout(Duration::from_secs(5), connection.read_datagram()).await {
       Ok(Ok(data)) => data,
@@ -561,44 +625,23 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
          return Err(err.into());
       }
       Err(_) => {
-         connection.close(AuthenticationFailure.into(), b"handshake timed out");
-         return Err(PeerRejected("handshake timed out".to_string()));
+         let err = HandshakeTimeout;
+         connection.close(AuthenticationFailure.into(), err.to_string().as_bytes());
+         return Err(err.into());
       }
    };
    if handshake_packet.starts_with(AuthCommands::INIT) {
-      match authenticate_peer(&mut connection).await {
-         Ok(_) => {
-            connection
-               .send_datagram(AuthCommands::ACKNOWLEDGE.into())
-               .map_err(Error::from)?;
-            Ok(connection)
-         }
-         Err(PeerRejected(reason)) => {
-            connection.close(AuthenticationFailure.into(), reason.as_bytes());
-            Err(PeerRejected(reason))
-         }
-         Err(err) => {
-            connection.close(AuthenticationFailure.into(), err.to_string().as_bytes());
-            Err(PeerRejected(err.to_string()))
-         }
-      }
+      authenticate_peer(&mut connection).await?;
+      Ok(connection)
    } else if handshake_packet.starts_with(AuthCommands::PAIR) {
-      match pair_peer(&mut connection, Some(pair_mode)).await {
-         Ok(_) => Ok(connection),
-         Err(PeerRejected(reason)) => {
-            connection.close(AuthenticationFailure.into(), reason.as_bytes());
-            Err(PeerRejected(reason))
-         }
-         Err(err) => {
-            connection.close(AuthenticationFailure.into(), err.to_string().as_bytes());
-            Err(PeerRejected(err.to_string()))
-         }
-      }
+      pair_peer(&mut connection, Some(pair_mode)).await?;
+      Ok(connection)
    } else {
-      connection.close(AuthenticationFailure.into(), b"invalid auth handshake data");
-      Err(PeerRejected("invalid auth handshake data".to_string()))
+      let err = InvalidAuthData;
+      Err(err.into())
    }
 }
+
 #[cfg(test)]
 mod tests {
    use super::*;

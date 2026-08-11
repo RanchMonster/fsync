@@ -1,7 +1,7 @@
 mod error;
 mod p2p_auth;
-pub use error::{Error, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use p2p_auth::AuthError;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use tokio::task::{self};
@@ -98,10 +98,9 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
             match handle_incoming(incoming, &pair_mode).await {
                 Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
                 Err(err) => match err {
-                    Error::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
-                    Error::PeerRejected(reason) => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
-                    error => unreachable!("This error shouldn't be possible
-                        if you are seeing this please submit a new issue with the following message:{error:?}"),
+                    AuthError::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
+                    reason => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
+
                 }
             }
          }

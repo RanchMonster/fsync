@@ -1,5 +1,8 @@
+use super::p2p_auth::AuthError;
 use quinn::VarInt;
 use thiserror::Error;
+
+/// Errors raised by the QUIC transport layer.
 #[derive(Error, Debug)]
 pub enum QuicError {
    #[error(transparent)]
@@ -14,23 +17,8 @@ pub enum QuicError {
    SendDatagram(#[from] quinn::SendDatagramError),
 }
 
-#[derive(Error, Debug)]
-pub enum Error {
-   #[error(transparent)]
-   Quic(QuicError),
-   #[error("Discovery error {0}")]
-   Discovery(String),
-   #[error("Peer rejected {0}")]
-   PeerRejected(String),
-}
-impl<T> From<T> for Error
-where
-   T: Into<QuicError>,
-{
-   fn from(err: T) -> Self {
-      Self::Quic(err.into())
-   }
-}
+/// The reason a connection is closed, encoded as a QUIC application error
+/// code.
 #[repr(u32)]
 pub enum CloseCode {
    InvalidProtocol = 1,
@@ -45,4 +33,3 @@ impl Into<VarInt> for CloseCode {
       VarInt::from_u32(self as u32)
    }
 }
-pub type Result<T, E = Error> = std::result::Result<T, E>;
