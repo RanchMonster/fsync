@@ -44,7 +44,7 @@ pub struct ConfigIntermediary {
    pub hostname: String,
 
    pub password: Option<String>,
-   pub sync_dirs: Option<Vec<String>>,
+   pub sync_dirs: Vec<String>,
 }
 
 pub fn create_config_file() {
@@ -79,7 +79,7 @@ impl Into<ServiceConfigArgs> for ConfigIntermediary {
                PasswordHashString::new(&phc).expect("Failed to create password hash")
             });
             PairMode::Password(Arc::new(hash))
-         },
+         }
          "KEYONLY" => PairMode::KeyOnly,
          other => panic!("Unknown pair mode: {other}"),
       };
@@ -87,7 +87,7 @@ impl Into<ServiceConfigArgs> for ConfigIntermediary {
       ServiceConfigArgs {
          address: self.address,
          port: self.port,
-         sync_dirs: self.sync_dirs.expect("Sync dirs are required"),
+         sync_dirs: self.sync_dirs,
          pair_mode: pair_mode,
          hostname: self.hostname,
       }
