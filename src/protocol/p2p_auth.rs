@@ -15,7 +15,8 @@
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
 use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
-use quinn::{Connection, Incoming, Side};
+use hex::FromHexError;
+use quinn::{Connection, Incoming, RecvStream, Side};
 use rand::random;
 use std::{
    fmt::Display,
@@ -34,6 +35,10 @@ use crate::CONFIG_DIR;
 /// Re-exports the mTLS server config builder from the `mtls` submodule.
 pub use mtls::configure_server;
 use std::io::ErrorKind;
+
+const MAX_PASSWORD_ATTEMPTS: u32 = 5;
+const MAX_PASSWORD_LENGTH: usize = 256;
+
 /// A macro to unwrap a `Result`, returning an [`Error::PeerRejected`] with
 /// the given message on error.
 macro_rules! ok_or_reject {
@@ -241,23 +246,25 @@ pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`std::io::Error`] if writing the prompt or reading the input fails.
-#[instrument]
-fn prompt_user(prompt: &str) -> Result<String, std::io::Error> {
-   use std::io::{stdin, stdout};
-   let mut stdout = stdout();
-   stdout.write_all(prompt.as_bytes())?;
-   stdout.flush()?;
-   let mut line = String::new();
-   stdin().read_line(&mut line)?;
-   Ok(line.trim().to_string())
+async fn prompt_user(prompt: &'static str) -> Result<String, std::io::Error> {
+   fn sync_inner(prompt: &str) -> Result<String, std::io::Error> {
+      use std::io::{stdin, stdout};
+      let mut stdout = stdout();
+      stdout.write_all(prompt.as_bytes())?;
+      stdout.flush()?;
+      let mut line = String::new();
+      stdin().read_line(&mut line)?;
+      Ok(line.trim().to_string())
+   }
+   task::spawn_blocking(|| sync_inner(prompt))
+      .await
+      .expect("Thread unexpectedly panicked")
 }
 
 /// Client side of the pairing exchange: reads the pair mode announced by the
 /// server and provides the requested credentials, then records the peer as
 /// known on a successful exchange.
-/// NOTE: this function is cli only and should never be called from the service context
-/// (this function panics as a assertion that it will never be called from the service context and
-/// if it does it is a bug)
+/// NOTE: this function is cli only and after this function completes execution should never return
 ///
 /// # Panics
 ///
@@ -270,84 +277,88 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
       AuthCommands::REJECT.len(),
       "the pairing response must both be the same length"
    );
+
+   async fn accepted(channel_rx: &mut RecvStream) -> Result<bool> {
+      let mut response_buf = [0u8; AuthCommands::ACCEPT.len()];
+      let Ok(result) = timeout(
+         Duration::from_secs(5),
+         channel_rx.read_exact(&mut response_buf),
+      )
+      .await
+      else {
+         tracing::warn!("Timed out waiting for pairing response");
+         return Ok(false);
+      };
+      let _ = result?;
+      Ok(response_buf == AuthCommands::ACCEPT)
+   }
+   /// Helper function to simplify the decoding of the pairing key
+   fn decoed_pairing_key(key: &str) -> Result<[u8; 8], FromHexError> {
+      let key_hex = hex::decode(key)?
+         .try_into()
+         .map_err(|_| FromHexError::InvalidStringLength)?;
+      Ok(key_hex)
+   }
    let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
 
-   // I don't like doing this before completing the pairing but it made it easier to deal with lifetimes
-   let peer_id = peer_key_hash(connection)?;
-
-   /// A simple helper function to check if the peer has accepted the pairing
-   async fn accepted(
-      channel_tx: &mut quinn::SendStream, channel_rx: &mut quinn::RecvStream, peer_id: [u8; 32],
-   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-      let mut response = [0; AuthCommands::ACCEPT.len()]; // more than enough for the pairing response just arbitrarily chose
-      channel_rx
-      .read_exact(&mut response)
-      .await
-      .expect("Received invalid pairing response.\nThis is possibly a bug please submit a issue if you believe this is a bug");
-
-      if response == AuthCommands::ACCEPT {
-         task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
-            .await
-            .expect("Thread panicked unexpectedly")
-            .expect("Failed to add peer to known peers list");
-         Ok(())
-      } else if response == AuthCommands::REJECT {
-         Err("Pairing rejected by peer".into())
-      } else {
-         let lossy_response = String::from_utf8_lossy(&response);
-         Err(format!(
-            "unexpected pairing response: {lossy_response}\nThis is possibly a bug please submit a issue if you believe this is a bug"
-         )
-         .into())
-      }
-   }
-
    let mut mode_len = [0; 1];
-   channel_rx
-      .read_exact(&mut mode_len)
-      .await
-      .expect("Peer didn't respond to pairing request");
+   channel_rx.read_exact(&mut mode_len).await?;
    let mut mode_buf = vec![0; mode_len[0] as usize];
-   channel_rx
-      .read_exact(&mut mode_buf)
-      .await
-      .expect("Peer didn't respond to pairing request");
-   let mode_str = std::str::from_utf8(&mode_buf)
-      .expect("Pair mode is not valid utf-8 string this is likely a bug or a malicious peer");
-
+   channel_rx.read_exact(&mut mode_buf).await?;
+   let mode_str = ok_or_reject!(
+      std::str::from_utf8(&mode_buf),
+      "Received invalid pairing mode from peer"
+   );
    match mode_str {
       "RELAXED" => {}
 
-      "PASSWORD" => loop {
-         let password =
-            prompt_user("Password: ").expect("Unable to read valid string input from stdin");
-         if password.is_empty() || password.len() > 256 {
-            // I am not using tracing here because that is for logging this is for user feedback
-            eprintln!("Password must be between 1 and 256 characters long");
-            continue;
+      "PASSWORD" => {
+         let mut password_attempts = 0;
+         loop {
+            if password_attempts >= MAX_PASSWORD_ATTEMPTS {
+               todo!("Create auth error type and use it here");
+            }
+            let password = prompt_user("Password: ")
+               .await
+               // I am still expecting this because there are only two reasons this _could_ fail
+               // 1. stdin is not readable
+               // 2. the read data is not valid utf8/utf16
+               .expect("Failed to read password input");
+            if password.is_empty() || password.len() > 256 {
+               // I am not using tracing here because that is for logging this is for user feedback
+               eprintln!("Password must be between 1 and 256 characters long");
+               password_attempts += 1;
+               continue;
+            }
+            channel_tx.write_all(password.as_bytes()).await?;
+            if accepted(&mut channel_rx).await? {
+               break;
+            }
+            password_attempts += 1;
          }
-         channel_tx
-            .write_all(password.as_bytes())
-            .await
-            .expect("Peer connection closed unexpectedly");
-      },
+      }
 
       "STRICT" => {
-         let key_hex = task::spawn_blocking(|| prompt_user("Enter the pairing key: "))
-            .await
-            .expect("Failed to read pairing key")
-            .expect("Failed to read pairing key")
-            .chars()
-            .filter(|c| *c != '-')
-            .collect::<String>();
-         let key: [u8; 8] = hex::decode(key_hex)
-            .expect("invalid pairing key")
-            .try_into()
-            .expect("invalid pairing key");
-         channel_tx
-            .write_all(&key)
-            .await
-            .expect("Peer didn't respond to pairing request");
+         let mut key_attempts = 0;
+         loop {
+            if key_attempts >= MAX_PASSWORD_ATTEMPTS {
+               todo!("Create auth error type and use it here");
+            }
+            let key_hex = prompt_user("Enter the pairing key: ")
+               .await
+               // Same as password prompt
+               .expect("Failed to read pairing key input")
+               .chars()
+               .filter(|c| *c != '-')
+               .collect::<String>();
+            let key = decoed_pairing_key(&key_hex)
+               .expect("TODO: create auth error type and use that instead");
+            channel_tx.write_all(&key).await?;
+            if accepted(&mut channel_rx).await? {
+               break;
+            }
+            key_attempts += 1;
+         }
       }
 
       "KEYONLY" => {}
@@ -358,6 +369,8 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          );
       }
    }
+
+   Ok(())
 }
 
 /// Server side of the pairing exchange: announces the configured pair mode,
