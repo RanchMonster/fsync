@@ -2,7 +2,6 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, RecommendedWatcher, Watcher};
 use std::{
    collections::HashMap,
-   fs,
    ops::{Deref, DerefMut},
    path::{Path, PathBuf},
    sync::Arc,
@@ -337,93 +336,97 @@ impl WatcherThread {
 }
 
 deref_impl!(WatcherThread, watcher, RecommendedWatcher);
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use std::fs;
+   #[tokio::test]
+   async fn test_find_ignores() {
+      let search_dir = std::env::current_dir().unwrap();
+      let mut ignores = IgnoreMap::new();
+      ignores.load(search_dir).await.unwrap();
+      assert!(!ignores.is_empty(), "No ignores found");
+      assert!(
+         ignores.len() == 1,
+         "Expected one ignore file only for this test"
+      );
+   }
+   #[tokio::test]
+   async fn test_ignore_rules() {
+      let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
+      let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
+      fs::create_dir(&search_dir).unwrap();
+      fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
+      let mut ignores = IgnoreMap::new();
+      ignores.load(search_dir.clone()).await.unwrap();
+      assert!(
+         !ignores.is_ignore(&search_dir),
+         "root directory should not be ignored"
+      );
+      assert!(
+         ignores.is_ignore(&search_dir.join("test.txt")),
+         "test.txt should be ignored"
+      );
+      assert!(
+         ignores.is_ignore(&search_dir.join("test_dir")),
+         "test_dir should be ignored",
+      );
+      let _ = fs::remove_dir_all(&search_dir);
+   }
+   #[tokio::test]
+   async fn test_sync_logic() {
+      let search_dir = std::env::temp_dir().join("fsync_test_sync_logic");
+      let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
+      fs::create_dir(&search_dir).unwrap();
 
-#[tokio::test]
-async fn test_find_ignores() {
-   let search_dir = std::env::current_dir().unwrap();
-   let mut ignores = IgnoreMap::new();
-   ignores.load(search_dir).await.unwrap();
-   assert!(!ignores.is_empty(), "No ignores found");
-   assert!(
-      ignores.len() == 1,
-      "Expected one ignore file only for this test"
-   );
-}
-#[tokio::test]
-async fn test_ignore_rules() {
-   let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
-   let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
-   fs::create_dir(&search_dir).unwrap();
-   fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
-   let mut ignores = IgnoreMap::new();
-   ignores.load(search_dir.clone()).await.unwrap();
-   assert!(
-      !ignores.is_ignore(&search_dir),
-      "root directory should not be ignored"
-   );
-   assert!(
-      ignores.is_ignore(&search_dir.join("test.txt")),
-      "test.txt should be ignored"
-   );
-   assert!(
-      ignores.is_ignore(&search_dir.join("test_dir")),
-      "test_dir should be ignored",
-   );
-   let _ = fs::remove_dir_all(&search_dir);
-}
-#[tokio::test]
-async fn test_sync_logic() {
-   let search_dir = std::env::temp_dir().join("fsync_test_sync_logic");
-   let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
-   fs::create_dir(&search_dir).unwrap();
-
-   let mut watcher = WatcherThread::init().expect("Failed to initialize watcher");
-   let mut sub = watcher
-      .subscribe(search_dir.clone())
-      .await
-      .expect("Failed to subscribe to watcher");
-   fs::write(&search_dir.join("test.txt"), "Hello World").unwrap();
-   if let Ok(events) = sub.recv().await {
-      assert!(
-         events
-            .iter()
-            .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
-         "test.txt should be created\n{events:?}"
-      );
+      let mut watcher = WatcherThread::init().expect("Failed to initialize watcher");
+      let mut sub = watcher
+         .subscribe(search_dir.clone())
+         .await
+         .expect("Failed to subscribe to watcher");
+      fs::write(&search_dir.join("test.txt"), "Hello World").unwrap();
+      if let Ok(events) = sub.recv().await {
+         assert!(
+            events
+               .iter()
+               .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
+            "test.txt should be created\n{events:?}"
+         );
+      }
+      fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
+      if let Ok(events) = sub.recv().await {
+         assert!(
+            events
+               .iter()
+               .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
+            "test.txt should be modified\n{events:?}"
+         );
+      }
+      fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt")).unwrap();
+      if let Ok(events) = sub.recv().await {
+         assert!(
+            events
+               .iter()
+               .any(|event| event.paths.contains(&search_dir.join("test2.txt")))
+         );
+      }
+      fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt")).unwrap();
+      if let Ok(events) = sub.recv().await {
+         assert!(
+            events
+               .iter()
+               .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
+         );
+      }
+      fs::remove_file(&search_dir.join("test3.txt")).unwrap();
+      if let Ok(events) = sub.recv().await {
+         assert!(
+            events
+               .iter()
+               .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
+            "test3.txt should be removed\n{events:?}"
+         );
+      }
+      let _ = fs::remove_dir_all(&search_dir);
    }
-   fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
-   if let Ok(events) = sub.recv().await {
-      assert!(
-         events
-            .iter()
-            .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
-         "test.txt should be modified\n{events:?}"
-      );
-   }
-   fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt")).unwrap();
-   if let Ok(events) = sub.recv().await {
-      assert!(
-         events
-            .iter()
-            .any(|event| event.paths.contains(&search_dir.join("test2.txt")))
-      );
-   }
-   fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt")).unwrap();
-   if let Ok(events) = sub.recv().await {
-      assert!(
-         events
-            .iter()
-            .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
-      );
-   }
-   fs::remove_file(&search_dir.join("test3.txt")).unwrap();
-   if let Ok(events) = sub.recv().await {
-      assert!(
-         events
-            .iter()
-            .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
-         "test3.txt should be removed\n{events:?}"
-      );
-   }
-   let _ = fs::remove_dir_all(&search_dir);
 }
