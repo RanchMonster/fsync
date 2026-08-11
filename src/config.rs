@@ -136,3 +136,37 @@ fn read_config_file() -> ConfigIntermediary {
 
    toml::from_str(&config_contents).expect("Failed to read config file")
 }
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use std::fs;
+
+   #[test]
+   fn test_config_file_creation_defaults_and_reading() {
+      let config_file_path = CONFIG_DIR.join("config.toml");
+      let _ = fs::remove_file(&config_file_path);
+
+      // creation of the config file in the test dir
+      assert!(!config_file_path.exists());
+      create_config_file();
+      assert!(config_file_path.exists());
+
+      // writing of the default config
+      let contents = fs::read_to_string(&config_file_path).expect("Failed to read config file");
+      assert!(contents.contains("address = \"0.0.0.0\""));
+      assert!(contents.contains("port = 43127"));
+      assert!(contents.contains("sync_dirs = []"));
+      assert!(contents.contains("pair_mode = \"RELAXED\""));
+      assert!(contents.contains("hostname = \"fsync\""));
+
+      // reading from the config object
+      let config = read_config_file();
+      assert_eq!(config.address, "0.0.0.0");
+      assert_eq!(config.port, 43127);
+      assert_eq!(config.sync_dirs, Vec::<String>::new());
+      assert_eq!(config.pair_mode, "RELAXED");
+      assert_eq!(config.hostname, "fsync");
+      assert_eq!(config.password, None);
+   }
+}
