@@ -67,7 +67,7 @@ pub enum AuthError {
    #[error("Key mismatch")]
    KeyMismatch,
    #[error("failed to register peer: {0}")]
-   FailedToRegisterPeer(#[source] JoinError),
+   FailedToRegisterPeer(#[source] std::io::Error),
    #[error("peer connection timed out")]
    PeerTimeout,
    #[error("handshake timed out")]
@@ -482,6 +482,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
    let peer_id = peer_key_hash(connection)?;
    task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
       .await
+      .expect("Thread unexpectedly panicked")
       .map_err(FailedToRegisterPeer)?;
    Ok(())
 }
@@ -547,7 +548,7 @@ pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()>
    authenticate_peer(connection).await?;
    match timeout(Duration::from_secs(5), connection.read_datagram()).await {
       Ok(Ok(data)) if data.starts_with(AuthCommands::ACKNOWLEDGE) => Ok(()),
-      _ => Err(PeerTimeout.into()),
+      _ => Err(PeerTimeout),
    }
 }
 
