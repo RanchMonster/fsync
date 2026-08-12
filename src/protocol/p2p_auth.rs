@@ -43,28 +43,6 @@ pub use mtls::configure_server;
 const MAX_PASSWORD_ATTEMPTS: u32 = 5;
 const MAX_PASSWORD_LENGTH: usize = 256;
 
-/// A macro to unwrap a `Result`, returning an [`AuthError`] converted into the
-/// parent error type on error.
-macro_rules! ok_or_reject {
-   ($e:expr,$err:expr) => {
-      match $e {
-         Ok(x) => x,
-         Err(_) => return Err($err.into()),
-      }
-   };
-}
-
-/// Unwraps an `Option` value, returning an [`AuthError`] converted into the
-/// parent error type on `None`.
-macro_rules! some_or_reject {
-   ($e:expr,$err:expr) => {
-      match $e {
-         Some(x) => x,
-         None => return Err($err.into()),
-      }
-   };
-}
-
 /// Errors that can occur during peer authentication and pairing.
 #[derive(Error, Debug)]
 pub enum AuthError {
@@ -73,13 +51,13 @@ pub enum AuthError {
    #[error("peer identity is not a valid certificate(s)")]
    InvalidPeerIdentity,
    #[error("failed to check known peers")]
-   KnownPeersCheckFailed,
+   KnownPeersCheckFailed(#[source] JoinError),
    #[error("peer is not a known peer")]
    UnknownPeer,
    #[error("Received invalid pairing mode from peer")]
    InvalidPairMode,
    #[error("failed to verify password")]
-   PasswordVerificationFailure,
+   PasswordVerificationFailure(#[source] JoinError),
    #[error("Key only mode does not allow pairing")]
    PairingNotAllowed,
    #[error("Password must be at least 1 character long")]
@@ -266,19 +244,16 @@ fn add_known_peer(peer: KnownPeer) -> Result<(), std::io::Error> {
 #[instrument(skip(connection))]
 fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
    use AuthError::{InvalidPeerIdentity, NoPeerIdentity};
-   let identity = some_or_reject!(connection.peer_identity(), NoPeerIdentity);
+   let identity = connection.peer_identity().ok_or(NoPeerIdentity)?;
 
-   let tls_handshake_data = ok_or_reject!(
-      identity.downcast::<Vec<rustls::pki_types::CertificateDer>>(),
-      InvalidPeerIdentity
-   );
+   let tls_handshake_data = identity
+      .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+      .map_err(|_| InvalidPeerIdentity)?;
 
-   let peer_cert = some_or_reject!(tls_handshake_data.first(), InvalidPeerIdentity);
+   let peer_cert = tls_handshake_data.first().ok_or(InvalidPeerIdentity)?;
 
-   let (_, x509_cert) = ok_or_reject!(
-      x509_parser::parse_x509_certificate(peer_cert),
-      InvalidPeerIdentity
-   );
+   let (_, x509_cert) =
+      x509_parser::parse_x509_certificate(peer_cert).map_err(|_| InvalidPeerIdentity)?;
 
    let public_key = x509_cert.public_key().raw;
    Ok(*blake3::hash(public_key).as_bytes())
@@ -293,10 +268,9 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
 pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use AuthError::{KnownPeersCheckFailed, UnknownPeer};
    let peer_id = peer_key_hash(connection)?;
-   let is_known = ok_or_reject!(
-      task::spawn_blocking(move || is_known_peer(&peer_id)).await,
-      KnownPeersCheckFailed
-   );
+   let is_known = task::spawn_blocking(move || is_known_peer(&peer_id))
+      .await
+      .map_err(KnownPeersCheckFailed)?;
    if !is_known {
       return Err(UnknownPeer.into());
    }
@@ -374,7 +348,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
    channel_rx.read_exact(&mut mode_len).await?;
    let mut mode_buf = vec![0; mode_len[0] as usize];
    channel_rx.read_exact(&mut mode_buf).await?;
-   let mode_str = ok_or_reject!(std::str::from_utf8(&mode_buf), InvalidPairMode);
+   let mode_str = std::str::from_utf8(&mode_buf).map_err(|_| InvalidPairMode)?;
    match mode_str {
       "RELAXED" => {}
 
@@ -475,15 +449,13 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 
          let client_password = client_password[..read].to_vec();
          let verifier = Argon2::default();
-         let accept = ok_or_reject!(
-            task::spawn_blocking(move || {
-               verifier
-                  .verify_password(&client_password, &password.password_hash())
-                  .is_ok()
-            })
-            .await,
-            PasswordVerificationFailure
-         );
+         let accept = task::spawn_blocking(move || {
+            verifier
+               .verify_password(&client_password, &password.password_hash())
+               .is_ok()
+         })
+         .await
+         .map_err(PasswordVerificationFailure)?;
          if !accept {
             channel_tx.write_all(AuthCommands::REJECT).await?;
             return Err(PasswordRejected.into());
