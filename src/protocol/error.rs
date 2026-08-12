@@ -1,4 +1,3 @@
-use super::p2p_auth::AuthError;
 use quinn::VarInt;
 use thiserror::Error;
 

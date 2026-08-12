@@ -20,7 +20,7 @@ use quinn::{Connection, Incoming, RecvStream, Side};
 use rand::random;
 use std::{
    fmt::Display,
-   fs::{self, File},
+   fs::File,
    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
    str::FromStr,
    sync::Arc,
