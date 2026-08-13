@@ -1,17 +1,18 @@
+mod discovery;
 mod error;
 pub mod p2p_auth;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use discovery::{EventError, advertise_local_client, handle_event};
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use p2p_auth::AuthError;
-use quinn::Endpoint;
-use std::net::SocketAddr;
+use p2p_auth::{PairMode, authenticate_client_side, configure_server, handle_incoming};
+use quinn::{ConnectError, ConnectionError, Endpoint};
+use std::{collections::HashSet, net::SocketAddr};
+use thiserror::Error;
 use tokio::task::{self};
-
-pub use crate::protocol::p2p_auth::PairMode;
-use crate::protocol::p2p_auth::{configure_server, handle_incoming};
-
-const SERVICE_TYPE: &str = "_fsync._udp.local.";
-const VERSION_KEY_PROPERTY: &str = "version";
-const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
+pub const SERVICE_TYPE: &str = "_fsync._udp.local.";
+const DEFAULT_PORT: u16 = 43127;
+pub const VERSION_KEY_PROPERTY: &str = "version";
+pub const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 
 // cleaner then a bunch of arguments
@@ -60,7 +61,8 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
    let browser = advertising_daemon
       .browse(SERVICE_TYPE)
       .expect("Failed to browse for peers");
-
+   // Define event loop variables
+   let mut discovered_peers = HashSet::new();
    // event loop for the service
    'service: loop {
       tokio::select! {
@@ -89,7 +91,6 @@ async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> Se
       hostname.len() <= 15,
       "Hostname cannot be longer than 15 characters"
    );
-   
 
    task::spawn_blocking(move || {
       let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
