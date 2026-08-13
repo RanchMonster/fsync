@@ -543,11 +543,17 @@ pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>
 /// Returns [`AuthError`] if the peer is not a known peer or the server does
 /// not acknowledge the connection within the timeout.
 pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()> {
-   use AuthError::PeerTimeout;
+   use AuthError::{InvalidAuthData, PeerTimeout};
    connection.send_datagram(AuthCommands::INIT.into())?;
    authenticate_peer(connection).await?;
    match timeout(Duration::from_secs(5), connection.read_datagram()).await {
-      Ok(Ok(data)) if data.starts_with(AuthCommands::ACKNOWLEDGE) => Ok(()),
+      Ok(Ok(data)) => {
+         if data.starts_with(AuthCommands::ACKNOWLEDGE) {
+            Ok(())
+         } else {
+            Err(InvalidAuthData)
+         }
+      }
       _ => Err(PeerTimeout),
    }
 }
