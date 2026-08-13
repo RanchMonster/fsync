@@ -12,7 +12,6 @@
 //! authenticity is instead established by the application-layer handshake in
 //! the parent `p2p_auth` module.
 use crate::CONFIG_DIR;
-use crate::protocol::error::Result;
 use quinn::{
    ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -22,11 +21,17 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::PathBuf, sync::Arc};
+use tracing::instrument;
+// So as far as tls goes, I am less concerned with the errors here because in most cases they are
+// not things that can be recovered from and I am just going to use tracing and likely panicing
+// further up the stack to handle these errors.
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const PROTOCOL_NAME: &str = concat!("fsync", env!("CARGO_PKG_VERSION"));
 
 /// Returns the on-disk paths for the cached certificate and private key for
 /// the given name, creating the `CONFIG_DIR/certs` directory (permissioned
 /// `0o700` on unix) if it does not exist.
+#[instrument]
 fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
    let dir = CONFIG_DIR.join("certs");
    fs::create_dir_all(&dir)?;
@@ -48,8 +53,9 @@ fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
 ///
 /// # Errors
 ///
-/// Returns `Error::Io` if the cache files cannot be read or written, and
-/// `Error::Rcgen` if the certificate or key cannot be generated.
+/// Returns a boxed error if the cache files cannot be read or written, or if
+/// the certificate or key cannot be generated.
+#[instrument]
 fn generate_self_signed_cert(
    name: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
@@ -167,8 +173,9 @@ impl rustls::server::danger::ClientCertVerifier for SignatureVerifyingClientVeri
 ///
 /// # Errors
 ///
-/// Returns `Error::Io` if the cached certificate and key cannot be read or
-/// written, and `Error::Rcgen` if certificate generation fails.
+/// Returns a boxed error if the cached certificate and key cannot be read or
+/// written, or if certificate generation fails.
+#[instrument]
 pub fn configure_server(name: &str) -> Result<ServerConfig> {
    let (cert_chain, private_key) = generate_self_signed_cert(name)?;
 
@@ -196,8 +203,9 @@ pub fn configure_server(name: &str) -> Result<ServerConfig> {
 ///
 /// # Errors
 ///
-/// Returns `Error::Io` if the cached certificate and key cannot be read or
-/// written, and `Error::Rcgen` if certificate generation fails.
+/// Returns a boxed error if the cached certificate and key cannot be read or
+/// written, or if certificate generation fails.
+#[instrument]
 pub fn configure_client(name: &str) -> Result<ClientConfig> {
    let (cert_chain, private_key) = generate_self_signed_cert(name)?;
 

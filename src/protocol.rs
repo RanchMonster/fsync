@@ -1,7 +1,7 @@
 mod error;
 mod p2p_auth;
-pub use error::{Error, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use p2p_auth::AuthError;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use tokio::task::{self};
@@ -19,14 +19,13 @@ struct ServiceConfigArgs {
    pub address: Option<String>,
    pub port: Option<u16>,
    // this field is required
-   pub sync_dirs: Vec<String>,
    pub pair_mode: Option<PairMode>,
    pub hostname: Option<String>,
    // add more as needed
    // once we have figured out a config and put stuff togother more we will need to add this
    // sync_dirs: todo!("whatever we use to represent sync dirs"),
 }
-async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
+async fn start_service(config_args: ServiceConfigArgs) -> ! {
    // load args from the config given
    let hostname = config_args.hostname.unwrap_or_else(|| {
       let mut name = hostname::get()
@@ -45,25 +44,50 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
       "Hostname cannot be longer than 15 characters"
    );
    let address = config_args.address.unwrap_or_else(|| "0.0.0.0".to_string());
-   let port = config_args.port.unwrap_or(DEFAULT_PORT);
+   let config_port = config_args.port;
+   let port = config_port.unwrap_or(DEFAULT_PORT);
    let pair_mode = config_args.pair_mode.unwrap_or(PairMode::Relaxed);
 
    // configure the serve and attempt to locate peers on the network that we can talk to
-   let server_config = configure_server(&hostname)?;
-   let endpoint = Endpoint::server(
-      server_config,
-      format!("{address}:{port}")
-         .parse()
-         .expect("Invalid address or port"),
-   )?;
-   let local_addr = endpoint.local_addr()?;
+   let server_config = configure_server(&hostname).expect("Failed to configure server");
+   let socket_addr = format!("{address}:{port}")
+      .parse()
+      .expect("Invalid address or port");
+   let endpoint = match Endpoint::server(server_config.clone(), socket_addr) {
+      Ok(endpoint) => endpoint,
+
+      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && config_port.is_none() => {
+         tracing::warn!("Default port {port} is in use, using a random free port instead");
+         let fallback_addr = format!("{address}:0")
+            .parse()
+            .expect("Invalid address or port");
+         Endpoint::server(server_config, fallback_addr)
+            .expect("Failed to create service endpoint on a random free port")
+      }
+      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+         if config_port.is_none() {
+            tracing::warn!("Default port {port} is in use, using a random free port instead");
+            let fallback_addr = format!("{address}:0")
+               .parse()
+               .expect("Invalid address or port");
+            Endpoint::server(server_config, fallback_addr)
+               .expect("Failed to create service endpoint on a random free port")
+         } else {
+            panic!("Port {port} is in use, set a different port: {err}");
+         }
+      }
+      Err(err) => panic!("Failed to create service endpoint on {address}:{port}: {err}"),
+   };
+   let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
 
    tracing::debug!("Advertising {hostname}");
    // start the advertisement daemon
-   let advertise_daemon = advertise(local_addr, hostname).await?;
+   let advertising_daemon = advertise_local_client(local_addr, hostname).await;
    tracing::debug!("Looking for peers");
-   let browser = advertise_daemon.browse(SERVICE_TYPE)?;
+   let browser = advertising_daemon
+      .browse(SERVICE_TYPE)
+      .expect("Failed to browse for peers");
 
    // event loop for the service
    'service: loop {
@@ -71,7 +95,14 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
             accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
-            handle_incoming(incoming, &pair_mode).await?;
+            match handle_incoming(incoming, &pair_mode).await {
+                Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
+                Err(err) => match err {
+                    AuthError::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
+                    reason => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
+
+                }
+            }
          }
          _event = browser.recv_async() => {
             todo!("handle events");
@@ -80,14 +111,14 @@ async fn start_service(config_args: ServiceConfigArgs) -> Result<()> {
    }
 }
 
-async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceDaemon> {
+async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
    assert!(!hostname.is_empty(), "Hostname cannot be empty");
    assert!(
       hostname.len() <= 15,
       "Hostname cannot be longer than 15 characters"
    );
-   let mdns = task::spawn_blocking(move || {
-      let mdns = ServiceDaemon::new().expect("Failed to create mdns daemon");
+   let service_daemon = task::spawn_blocking(move || {
+      let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
       // load the address from the environment variable or default to auto assigned
       let address = socket_adrr.ip().to_string();
       let port = socket_adrr.port();
@@ -100,12 +131,13 @@ async fn advertise(socket_adrr: SocketAddr, hostname: String) -> Result<ServiceD
          [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
       )?
       .enable_addr_auto();
-      mdns.register(service_info)?;
+      service_daemon.register(service_info)?;
 
-      Ok::<_, Error>(mdns)
+      Ok::<_, Box<dyn std::error::Error + Send + Sync>>(service_daemon)
    })
-   .await;
-   let mdns = mdns.expect("Thread unexpectedly panicked")?;
+   .await
+   .expect("Thread unexpectedly panicked")
+   .expect("Failed to create mdns service daemon");
 
-   Ok(mdns)
+   service_daemon
 }
