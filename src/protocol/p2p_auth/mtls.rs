@@ -11,7 +11,7 @@
 //! [`configure_client`] skips server certificate validation entirely. Peer
 //! authenticity is instead established by the application-layer handshake in
 //! the parent `p2p_auth` module.
-use crate::CONFIG_DIR;
+use crate::{CONFIG_DIR, protocol::discovery::HEX_ENCODED_PEER_ID_LENGTH};
 use quinn::{
    ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -88,6 +88,24 @@ pub fn generate_self_signed_cert(
    #[cfg(unix)]
    fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
    Ok((vec![cert_der], key_der))
+}
+
+/// Returns the peer id of the certificate with the given name.
+/// The certificate must have been generated with [`generate_self_signed_cert`].
+/// The peer id is the blake3 hash encoded as a hex string.
+pub fn get_peer_id(name: &str) -> Result<String> {
+   let (cert_path, _) = generate_self_signed_cert(name)?;
+   assert_eq!(cert_path.len(), 1, "Cert path should have one element");
+   let raw_cert = &cert_path[0];
+   let (_, parsed_cert) = x509_parser::parse_x509_certificate(raw_cert)?;
+   let public_key = parsed_cert.public_key().raw;
+   let peer_id = blake3::hash(public_key);
+   let hex_encoded_peer_id = hex::encode(peer_id.as_bytes());
+   assert!(
+      hex_encoded_peer_id.len() == HEX_ENCODED_PEER_ID_LENGTH,
+      "Peer id must be the correct length"
+   );
+   Ok(hex_encoded_peer_id)
 }
 
 /// Verifies a TLS 1.2 handshake signature against the given certificate using
