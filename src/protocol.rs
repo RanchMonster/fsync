@@ -55,15 +55,6 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
       .expect("Invalid address or port");
    let endpoint = match Endpoint::server(server_config.clone(), socket_addr) {
       Ok(endpoint) => endpoint,
-
-      Err(err) if err.kind() == std::io::ErrorKind::AddrInUse && config_port.is_none() => {
-         tracing::warn!("Default port {port} is in use, using a random free port instead");
-         let fallback_addr = format!("{address}:0")
-            .parse()
-            .expect("Invalid address or port");
-         Endpoint::server(server_config, fallback_addr)
-            .expect("Failed to create service endpoint on a random free port")
-      }
       Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
          if config_port.is_none() {
             tracing::warn!("Default port {port} is in use, using a random free port instead");
