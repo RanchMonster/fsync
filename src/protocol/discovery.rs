@@ -25,7 +25,7 @@ pub enum EventError {
 }
 
 pub async fn handle_event(
-   event: ServiceEvent, endpoint: &mut Endpoint, discovered_services: &mut HashSet<String>,
+   event: &ServiceEvent, endpoint: &Endpoint, discovered_services: &mut HashSet<String>,
 ) -> std::result::Result<(), EventError> {
    use ConnectError::InvalidRemoteAddress;
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
@@ -104,6 +104,7 @@ pub async fn handle_event(
                   tracing::debug!("Connected to {fullname}");
                   discovered_services.insert(fullname.to_owned());
                }
+
                Err(InvalidRemoteAddress(addr)) => {
                   tracing::debug!("Invalid remote address {addr:?}");
                   continue;
@@ -120,7 +121,7 @@ pub async fn handle_event(
             "We should only be receiving service events for our service type"
          );
          tracing::info!("Service {fullname} no longer advertised");
-         discovered_services.remove(&fullname);
+         discovered_services.remove(fullname);
       }
       _ => {}
    }
