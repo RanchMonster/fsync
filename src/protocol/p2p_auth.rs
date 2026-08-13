@@ -37,10 +37,13 @@ use x509_parser::nom::AsBytes;
 use super::error::CloseCode;
 use crate::{CONFIG_DIR, protocol::error::QuicError};
 
+#[cfg(test)]
+pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod mtls;
 /// Re-exports the mTLS server and client config builders from the `mtls`
 /// submodule.
-pub use mtls::{configure_client, configure_server};
+pub use mtls::{configure_client, configure_server, get_peer_id};
 
 const MAX_PASSWORD_ATTEMPTS: u32 = 5;
 const MAX_PASSWORD_LENGTH: usize = 256;
@@ -616,4 +619,102 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
    } else {
       Err(InvalidAuthData)
    }
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use quinn::{Connecting, Incoming};
+   use tokio::task::JoinSet;
+
+   const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
+
+   #[test]
+   fn test_known_peer_comparison() {
+      let random_key = random::<[u8; 32]>();
+      let peer = KnownPeer(random_key);
+      let hexed_key = hex::encode(random_key);
+      let prased_key = KnownPeer::from_str(&hexed_key).expect("failed to parse known peer");
+      assert_eq!(peer, prased_key);
+   }
+
+   #[test]
+   fn test_is_known_peers_found() {
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let known_key = random::<[u8; 32]>();
+      let other_key = random::<[u8; 32]>();
+      let path = CONFIG_DIR.join("known_peers");
+      let contents = format!(
+         "{}\n\n{}\n{}\n",
+         KnownPeer(other_key),
+         "not-a-valid-hex-line",
+         KnownPeer(known_key)
+      );
+      std::fs::write(&path, contents).expect("failed to write known peers file");
+      assert!(is_known_peer(&known_key));
+      assert!(is_known_peer(&other_key));
+      assert!(!is_known_peer(&random::<[u8; 32]>()));
+      let _ = std::fs::remove_file(&path);
+   }
+
+   #[test]
+   fn test_is_known_peers_missing_file() {
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+      let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
+      assert!(!is_known_peer(&random::<[u8; 32]>()));
+   }
+
+   async fn connecting_peer(connect_attempt: Connecting) {
+      let mut connection = connect_attempt.await.expect("failed to connect");
+      // send pairing request
+      connection
+         .send_datagram(AuthCommands::PAIR.into())
+         .expect("failed to send pairing request");
+      pair_peer(&mut connection, None)
+         .await
+         .expect("failed to pair peer");
+   }
+
+   async fn responding_peer(incoming: Incoming, pair_mode: PairMode) {
+      handle_incoming(incoming, &pair_mode)
+         .await
+         .expect("failed to handle incoming connection");
+   }
+
+   #[tokio::test]
+   async fn test_pair_peer_relaxed() {
+      use quinn::Endpoint;
+      let _guard = KNOWN_PEERS_LOCK
+         .lock()
+         .unwrap_or_else(|poisoned| poisoned.into_inner());
+      // generate key and cert for virtual peers
+      let server_config =
+         mtls::configure_server("test-peer-server").expect("failed to configure server crypto");
+      let client_config =
+         mtls::configure_client("test-peer-client").expect("failed to configure client crypto");
+      // initialize the quic server
+      let server = Endpoint::server(
+         server_config,
+         TEST_SOCKET_ADDR.parse().expect("invalid socket addr"),
+      )
+      .expect("failed to create server endpoint");
+
+      // reuse the same endpoint to connect to the host peer
+      let local_addr = server.local_addr().expect("failed to get local addr");
+      let connection = server
+         .connect_with(client_config, local_addr, "test-peer-server")
+         .expect("failed to connect to server");
+      let mut task_set = JoinSet::new();
+      task_set.spawn(connecting_peer(connection));
+      task_set.spawn(responding_peer(
+         server.accept().await.expect("failed to accept connection"),
+         PairMode::Relaxed,
+      ));
+      task_set.join_all().await;
+   }
+   // I still need to figure out how to write the other tests
 }
