@@ -9,6 +9,8 @@ use quinn::{ConnectError, ConnectionError, Endpoint};
 use std::{collections::HashSet, net::SocketAddr};
 use thiserror::Error;
 use tokio::task::{self};
+
+use crate::protocol::p2p_auth::{configure_client, get_peer_id};
 pub const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const DEFAULT_PORT: u16 = 43127;
 pub const VERSION_KEY_PROPERTY: &str = "version";
@@ -42,29 +44,40 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname).expect("Failed to configure server");
+   let client_config = configure_client(&hostname).expect("Failed to configure client");
    let socket_addr = format!("{config_address}:{config_port}")
       .parse()
       .expect("Invalid address or port");
-   let endpoint = match Endpoint::server(server_config, socket_addr) {
+
+   let mut endpoint = match Endpoint::server(server_config.clone(), socket_addr) {
       Ok(endpoint) => endpoint,
       Err(err) => {
          panic!("Failed to create service endpoint on {config_address}:{config_port}: {err}")
       }
    };
+
+   // ensure we also set the client config when we attempt to connect to peers we find
+   endpoint.set_default_client_config(client_config);
+
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
 
-   tracing::debug!("Advertising {hostname}");
+   let peer_id = get_peer_id(&hostname).expect("Failed to get peer id");
+   tracing::debug!("Advertising {hostname} as ");
+
    // start the advertisement daemon
-   let advertising_daemon = advertise_local_client(local_addr, hostname).await;
+   let advertising_daemon = advertise_local_client(local_addr, hostname, &peer_id).await;
    tracing::debug!("Looking for peers");
+
    let browser = advertising_daemon
       .browse(SERVICE_TYPE)
       .expect("Failed to browse for peers");
+
    // Define event loop variables
    let mut discovered_peers = HashSet::new();
+
    // event loop for the service
-   'service: loop {
+   loop {
       tokio::select! {
             accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
@@ -78,8 +91,13 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
                 }
             }
          }
-         _event = browser.recv_async() => {
-            todo!("handle events");
+         event = browser.recv_async() => {
+         let event = event.expect("Unexpectedly closed mdns browser");
+      match handle_event(&event, &endpoint, &mut discovered_peers).await{
+         Ok(_) => continue,
+         Err(err) => tracing::error!("Failed to handle service event: {event:?}: {err}"),
+
+         }
          }
       }
    }
