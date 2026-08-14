@@ -6,8 +6,10 @@ use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use p2p_auth::AuthError;
 use p2p_auth::{PairMode, authenticate_client_side, configure_server, handle_incoming};
 use quinn::{ConnectError, ConnectionError, Endpoint};
+use std::sync::Arc;
 use std::{collections::HashSet, net::SocketAddr};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::task::{self};
 
 use crate::protocol::p2p_auth::{configure_client, get_peer_id};
@@ -74,30 +76,41 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
       .expect("Failed to browse for peers");
 
    // Define event loop variables
-   let mut discovered_peers = HashSet::new();
-
+   let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
    // event loop for the service
    loop {
       tokio::select! {
-            accept = endpoint.accept() => {
+         accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
             match handle_incoming(incoming, &pair_mode).await {
-                Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
-                Err(err) => match err {
-                    AuthError::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),
-                    reason => tracing::warn!("Rejected connection to {local_addr:?}: {reason}"),
-
-                }
+               Ok(_connection) => {
+                  tracing::debug!("Connection accepted, handling is not implemented yet");
+               }
+               Err(err) => match err {
+                  AuthError::Quic(quic_error) => {
+                     tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}");
+                  }
+                  reason => {
+                     tracing::warn!("Rejected connection to {local_addr:?}: {reason}");
+                  }
+               },
             }
          }
          event = browser.recv_async() => {
-         let event = event.expect("Unexpectedly closed mdns browser");
-      match handle_event(&event, &endpoint, &mut discovered_peers).await{
-         Ok(_) => continue,
-         Err(err) => tracing::error!("Failed to handle service event: {event:?}: {err}"),
+            let event = event.expect("Unexpectedly closed mdns browser");
+            let discovered_peers = discovered_peers.clone();
+            let endpoint = endpoint.clone();
 
-         }
+            match task::spawn(handle_event(event, endpoint, discovered_peers))
+               .await
+               .expect("Thread unexpectedly panicked")
+            {
+               Ok(_) => continue,
+               Err(err) => {
+                  tracing::error!("Failed to handle service event: {err}");
+               }
+            }
          }
       }
    }
