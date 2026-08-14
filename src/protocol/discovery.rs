@@ -22,6 +22,10 @@ pub enum EventError {
    Connection(#[from] ConnectionError),
    #[error("Peer id was not a valid hex string")]
    InvalidPeerId(#[source] hex::FromHexError),
+   #[error(
+      "fullname must end with service type. We should only be receiving service events for our service type."
+   )]
+   InvalidFullname,
 }
 
 pub async fn handle_event(
@@ -50,11 +54,16 @@ pub async fn handle_event(
             tracing::warn!("peer id is not the correct length {peer_id:?}");
             return Ok(());
          }
-
-         assert!(
+         // this is asserted on debug and is checked on release
+         debug_assert!(
             fullname.ends_with(SERVICE_TYPE),
             "fullname must end with service type. We should only be receiving service events for our service type."
          );
+
+         #[cfg(not(debug_assertions))]
+         if !fullname.ends_with(SERVICE_TYPE) {
+            return Err(InvalidFullname);
+         }
 
          if discovered_services.contains(fullname) {
             tracing::debug!("Discovered service already connected to {fullname}");
@@ -96,14 +105,16 @@ pub async fn handle_event(
             let socket_addr = SocketAddr::new(ip_addr, port);
             tracing::debug!("Attempting to connect to {socket_addr:?} with peer id {peer_id:?}");
 
-            match endpoint.connect(socket_addr, hostname.clone()) {
+            match endpoint.connect(socket_addr, hostname) {
                Ok(connection) => {
                   let mut connection = connection.await?;
                   if let Err(error) = authenticate_client_side(&mut connection).await {
                      tracing::error!("Failed to authenticate self to peer: {error:?}");
+                     return Ok(());
                   }
                   tracing::debug!("Connected to {fullname}");
                   discovered_services.insert(fullname.to_owned());
+                  return Ok(());
                }
 
                Err(InvalidRemoteAddress(addr)) => {
