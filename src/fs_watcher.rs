@@ -33,12 +33,18 @@ macro_rules! deref_impl {
 /// Just a list of all the default ignore files supported by fsync
 const DEFAULT_IGNORE_FILES: &[&str] = &[".gitignore", ".ignore", ".fsyncignore"];
 
-#[cfg(not(test))]
-const FILE_EVENT_DELAY: Duration = Duration::from_secs(5); // Default time to wait before alerting the tree to the changes
-//
-#[cfg(test)]
-const FILE_EVENT_DELAY: Duration = Duration::from_secs(0); // In tests we don't want to wait for the file events because the it is a controlled environment
-//
+/// Time to wait before alerting the tree to the changes.
+///
+/// Overridable with the `FSYNC_FILE_EVENT_DELAY` environment variable (in
+/// milliseconds), which tests use to avoid waiting in a controlled
+/// environment.
+fn file_event_delay() -> Duration {
+   std::env::var("FSYNC_FILE_EVENT_DELAY")
+      .ok()
+      .and_then(|value| value.parse().ok())
+      .map(Duration::from_millis)
+      .unwrap_or(Duration::from_secs(5))
+}
 /// Error type for the local sync handler
 #[derive(Error, Debug)]
 pub enum LocalSyncError {
@@ -144,7 +150,7 @@ impl WatcherReceiver {
                   let event = event.map_err(|_| ReceiverClosed)?;
                   self.event_queue.push(event.clone());
                }
-               _ = tokio::time::sleep(FILE_EVENT_DELAY) => {
+               _ = tokio::time::sleep(file_event_delay()) => {
                   if self.event_queue.is_empty() {
                      continue;
                   }
@@ -155,12 +161,12 @@ impl WatcherReceiver {
    }
 }
 
-struct IgnoreMap {
+pub struct IgnoreMap {
    map: HashMap<PathBuf, Gitignore>,
 }
 
 impl IgnoreMap {
-   fn is_ignore(&self, path: &Path) -> bool {
+   pub fn is_ignore(&self, path: &Path) -> bool {
       assert!(path.is_absolute(), "Path must be absolute");
 
       for ancestor in path.ancestors() {
@@ -186,7 +192,7 @@ impl IgnoreMap {
       false
    }
 
-   async fn load(&mut self, path: PathBuf) -> Result<()> {
+   pub async fn load(&mut self, path: PathBuf) -> Result<()> {
       let ignores = find_ignores(path).await?;
       self.map.extend(
          ignores
@@ -197,7 +203,7 @@ impl IgnoreMap {
       Ok(())
    }
 
-   fn reload(&mut self, path: &Path) -> Result<()> {
+   pub fn reload(&mut self, path: &Path) -> Result<()> {
       assert!(path.is_absolute(), "Path must be absolute");
       assert!(path.is_file(), "Path must be a file");
 
@@ -230,7 +236,7 @@ impl IgnoreMap {
       Ok(())
    }
 
-   fn new() -> Self {
+   pub fn new() -> Self {
       Self {
          map: HashMap::new(),
       }
@@ -336,97 +342,3 @@ impl WatcherThread {
 }
 
 deref_impl!(WatcherThread, watcher, RecommendedWatcher);
-#[cfg(test)]
-mod tests {
-   use super::*;
-   use std::fs;
-   #[tokio::test]
-   async fn test_find_ignores() {
-      let search_dir = std::env::current_dir().unwrap();
-      let mut ignores = IgnoreMap::new();
-      ignores.load(search_dir).await.unwrap();
-      assert!(!ignores.is_empty(), "No ignores found");
-      assert!(
-         ignores.len() == 1,
-         "Expected one ignore file only for this test"
-      );
-   }
-   #[tokio::test]
-   async fn test_ignore_rules() {
-      let search_dir = std::env::temp_dir().join("fsync_test_ignore_rules");
-      let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
-      fs::create_dir(&search_dir).unwrap();
-      fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
-      let mut ignores = IgnoreMap::new();
-      ignores.load(search_dir.clone()).await.unwrap();
-      assert!(
-         !ignores.is_ignore(&search_dir),
-         "root directory should not be ignored"
-      );
-      assert!(
-         ignores.is_ignore(&search_dir.join("test.txt")),
-         "test.txt should be ignored"
-      );
-      assert!(
-         ignores.is_ignore(&search_dir.join("test_dir")),
-         "test_dir should be ignored",
-      );
-      let _ = fs::remove_dir_all(&search_dir);
-   }
-   #[tokio::test]
-   async fn test_sync_logic() {
-      let search_dir = std::env::temp_dir().join("fsync_test_sync_logic");
-      let _ = fs::remove_dir_all(&search_dir); // If the directory exists it will be removed
-      fs::create_dir(&search_dir).unwrap();
-
-      let mut watcher = WatcherThread::init().expect("Failed to initialize watcher");
-      let mut sub = watcher
-         .subscribe(search_dir.clone())
-         .await
-         .expect("Failed to subscribe to watcher");
-      fs::write(&search_dir.join("test.txt"), "Hello World").unwrap();
-      if let Ok(events) = sub.recv().await {
-         assert!(
-            events
-               .iter()
-               .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
-            "test.txt should be created\n{events:?}"
-         );
-      }
-      fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
-      if let Ok(events) = sub.recv().await {
-         assert!(
-            events
-               .iter()
-               .any(|event| event.paths.contains(&search_dir.join("test.txt"))),
-            "test.txt should be modified\n{events:?}"
-         );
-      }
-      fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt")).unwrap();
-      if let Ok(events) = sub.recv().await {
-         assert!(
-            events
-               .iter()
-               .any(|event| event.paths.contains(&search_dir.join("test2.txt")))
-         );
-      }
-      fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt")).unwrap();
-      if let Ok(events) = sub.recv().await {
-         assert!(
-            events
-               .iter()
-               .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
-         );
-      }
-      fs::remove_file(&search_dir.join("test3.txt")).unwrap();
-      if let Ok(events) = sub.recv().await {
-         assert!(
-            events
-               .iter()
-               .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
-            "test3.txt should be removed\n{events:?}"
-         );
-      }
-      let _ = fs::remove_dir_all(&search_dir);
-   }
-}
