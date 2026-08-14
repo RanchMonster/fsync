@@ -63,7 +63,7 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
    tracing::debug!("Listening on {local_addr}");
 
    let peer_id = get_peer_id(&hostname).expect("Failed to get peer id");
-   tracing::debug!("Advertising {hostname} as ");
+   tracing::debug!("Advertising {hostname} as {peer_id}");
 
    // start the advertisement daemon
    let advertising_daemon = advertise_local_client(local_addr, hostname, &peer_id).await;
