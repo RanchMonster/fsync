@@ -3,8 +3,9 @@ use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use hex::FromHexError;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::{ConnectError, ConnectionError, Endpoint};
-use std::{collections::HashSet, net::SocketAddr};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio::task;
 
 /// The length of a peer id in hex encoded form.
@@ -29,7 +30,7 @@ pub enum EventError {
 }
 
 pub async fn handle_event(
-   event: &ServiceEvent, endpoint: &Endpoint, discovered_services: &mut HashSet<String>,
+   event: ServiceEvent, endpoint: Endpoint, discovered_services: Arc<Mutex<HashSet<String>>>,
 ) -> std::result::Result<(), EventError> {
    use ConnectError::InvalidRemoteAddress;
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
@@ -65,7 +66,7 @@ pub async fn handle_event(
             return Err(InvalidFullname);
          }
 
-         if discovered_services.contains(fullname) {
+         if discovered_services.lock().await.contains(fullname) {
             tracing::debug!("Discovered service already connected to {fullname}");
             return Ok(());
          }
@@ -113,7 +114,7 @@ pub async fn handle_event(
                      return Ok(());
                   }
                   tracing::debug!("Connected to {fullname}");
-                  discovered_services.insert(fullname.to_owned());
+                  discovered_services.lock().await.insert(fullname.to_owned());
                   return Ok(());
                }
 
@@ -133,7 +134,7 @@ pub async fn handle_event(
             "We should only be receiving service events for our service type"
          );
          tracing::info!("Service {fullname} no longer advertised");
-         discovered_services.remove(fullname);
+         discovered_services.lock().await.remove(&fullname);
       }
       _ => {}
    }
@@ -360,37 +361,37 @@ mod tests {
    #[tokio::test]
    async fn test_resolved_missing_peer_id() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event_with_props(
          "no-peer-id",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
          1,
          &[("version", VERSION_NUMBER)],
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(matches!(result, Err(EventError::NoPeerId)));
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
    async fn test_resolved_missing_version() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event_with_props(
          "no-version",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
          1,
          &[("peer_id", &random_peer_id())],
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(matches!(result, Err(EventError::UnsupportedVersion)));
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
    async fn test_resolved_short_peer_id_skipped() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event(
          "short-id",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -398,15 +399,15 @@ mod tests {
          "too-short",
          VERSION_NUMBER,
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(result.is_ok());
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
    async fn test_resolved_unsupported_version() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event(
          "old-version",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -414,15 +415,15 @@ mod tests {
          &random_peer_id(),
          "999.0.0",
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(matches!(result, Err(EventError::UnsupportedVersion)));
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
    async fn test_resolved_invalid_hex_peer_id() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event(
          "bad-hex",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -430,9 +431,9 @@ mod tests {
          &"g".repeat(HEX_ENCODED_PEER_ID_LENGTH),
          VERSION_NUMBER,
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(matches!(result, Err(EventError::InvalidPeerId(_))));
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
@@ -442,7 +443,7 @@ mod tests {
          .unwrap_or_else(|poisoned| poisoned.into_inner());
       let _known_peers = KnownPeersGuard::set(&[]);
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event(
          "unknown-peer",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -450,17 +451,17 @@ mod tests {
          &random_peer_id(),
          VERSION_NUMBER,
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(result.is_ok());
-      assert!(discovered.is_empty());
+      assert!(discovered.lock().await.is_empty());
    }
 
    #[tokio::test]
    async fn test_resolved_duplicate_skipped() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let fullname = "dup._fsync._udp.local.".to_string();
-      discovered.insert(fullname.clone());
+      discovered.lock().await.insert(fullname.clone());
       let event = resolved_event(
          "dup",
          IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -468,43 +469,48 @@ mod tests {
          &random_peer_id(),
          VERSION_NUMBER,
       );
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(result.is_ok());
-      assert_eq!(discovered.len(), 1, "duplicate must not be re-added");
-      assert!(discovered.contains(&fullname));
+      assert_eq!(
+         discovered.lock().await.len(),
+         1,
+         "duplicate must not be re-added"
+      );
+      assert!(discovered.lock().await.contains(&fullname));
    }
 
    #[tokio::test]
    async fn test_removed_removes_service() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let gone = "gone._fsync._udp.local.".to_string();
       let stays = "stays._fsync._udp.local.".to_string();
-      discovered.insert(gone.clone());
-      discovered.insert(stays.clone());
+      discovered.lock().await.insert(gone.clone());
+      discovered.lock().await.insert(stays.clone());
 
       let event = ServiceEvent::ServiceRemoved(SERVICE_TYPE.to_string(), gone.clone());
-      let result = handle_event(&event, &endpoint, &mut discovered).await;
+      let result = handle_event(event, endpoint, discovered.clone()).await;
       assert!(result.is_ok());
       assert!(
-         !discovered.contains(&gone),
+         !discovered.lock().await.contains(&gone),
          "removed service must be dropped"
       );
-      assert!(discovered.contains(&stays), "other services must be kept");
+      assert!(
+         discovered.lock().await.contains(&stays),
+         "other services must be kept"
+      );
    }
 
    #[tokio::test]
    #[should_panic(expected = "We should only be receiving service events for our service type")]
    async fn test_removed_wrong_service_type_panics() {
       let endpoint = client_endpoint();
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = ServiceEvent::ServiceRemoved(
          "_other._tcp.local.".to_string(),
          "x._other._tcp.local.".to_string(),
       );
-      handle_event(&event, &endpoint, &mut discovered)
-         .await
-         .unwrap();
+      handle_event(event, endpoint, discovered).await.unwrap();
    }
 
    #[tokio::test]
@@ -541,7 +547,7 @@ mod tests {
       let mut endpoint = client_endpoint();
       endpoint.set_default_client_config(client_config);
 
-      let mut discovered = HashSet::new();
+      let discovered = Arc::new(Mutex::new(HashSet::new()));
       let event = resolved_event(
          server_name,
          ip,
@@ -552,14 +558,17 @@ mod tests {
 
       timeout(
          Duration::from_secs(15),
-         handle_event(&event, &endpoint, &mut discovered),
+         handle_event(event, endpoint, discovered.clone()),
       )
       .await
       .expect("handle_event timed out")
       .expect("handle_event failed");
 
       assert!(
-         discovered.contains(format!("{server_name}.{SERVICE_TYPE}").as_str()),
+         discovered
+            .lock()
+            .await
+            .contains(format!("{server_name}.{SERVICE_TYPE}").as_str()),
          "known peer should have been added to discovered services: {discovered:?}"
       );
       server_task.await.expect("server task panicked");
