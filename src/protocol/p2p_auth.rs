@@ -607,12 +607,12 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
    };
    if handshake_packet.starts_with(AuthCommands::INIT) {
       authenticate_peer(&mut connection).await?;
+      connection.send_datagram(AuthCommands::ACKNOWLEDGE.into())?;
       Ok(connection)
    } else if handshake_packet.starts_with(AuthCommands::PAIR) {
       pair_peer(&mut connection, Some(pair_mode)).await?;
       Ok(connection)
    } else {
-      let err = InvalidAuthData;
-      Err(err)
+      Err(InvalidAuthData)
    }
 }
