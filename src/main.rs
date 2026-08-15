@@ -1,4 +1,5 @@
 use blake3::Hash;
+mod config;
 mod fs_watcher;
 mod protocol;
 

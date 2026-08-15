@@ -178,7 +178,6 @@ pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
 /// `PAIR` request from an unknown peer. The `Display` form of the mode is what
 /// is announced to the pairing client over the wire. The default is
 /// [`PairMode::Relaxed`].
-#[derive(Debug)]
 pub enum PairMode {
    /// Strict mode: a random key is generated and announced, and the other
    /// device must enter it to complete the pairing.
