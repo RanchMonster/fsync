@@ -1,8 +1,11 @@
+use crate::protocol::discovery::EventError::{InvalidFullname, NoValidConnectionPath};
+use crate::protocol::p2p_auth::AuthError;
+
 use super::p2p_auth::{authenticate_client_side, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use hex::FromHexError;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use quinn::{ConnectError, ConnectionError, Endpoint};
+use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
+use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -13,6 +16,8 @@ pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
 const PEER_ID_KEY: &str = "peer_id";
 #[derive(Debug, Error)]
 pub enum EventError {
+   #[error(transparent)]
+   Auth(#[from] AuthError),
    #[error(transparent)]
    Connect(#[from] ConnectError),
    #[error("peer id not found")]
@@ -27,41 +32,81 @@ pub enum EventError {
       "fullname must end with service type. We should only be receiving service events for our service type."
    )]
    InvalidFullname,
+   #[error("Failed to find a valid connection path for {0}")]
+   NoValidConnectionPath(String),
 }
 
+type Result<T, E = EventError> = std::result::Result<T, E>;
+
+async fn find_valid_connect_path<I>(
+   endpoint: &Endpoint, addresses: I, hostname: &str, port: u16,
+) -> Result<Option<Connection>>
+where
+   I: IntoIterator<Item = ScopedIp>,
+{
+   use ConnectError::InvalidRemoteAddress;
+
+   fn is_valid(addr: &ScopedIp) -> bool {
+      #[cfg(not(test))]
+      return addr.is_ipv4() || addr.is_ipv6() && !addr.is_loopback();
+      #[cfg(test)]
+      // Easiest way to test is to allow loopback in tests only
+      return addr.is_ipv4() || addr.is_ipv6();
+   }
+   // has to be a closure due to the borrow checker
+   let to_socket_addr = |addr: ScopedIp| SocketAddr::new(addr.to_ip_addr(), port);
+
+   let addresses = addresses.into_iter().filter(is_valid).map(to_socket_addr);
+   for addr in addresses {
+      match endpoint.connect(addr, hostname) {
+         Ok(connection) => {
+            let connection = connection.await?;
+            return Ok(Some(connection));
+         }
+         Err(InvalidRemoteAddress(addr)) => {
+            tracing::debug!("Invalid remote address {addr:?}");
+            continue;
+         }
+         Err(err) => return Err(err.into()),
+      }
+   }
+   Ok(None)
+}
+/// Handles a service event from the mdns daemon.
+/// This function is responsible for handling mdns events and connecting to
+/// peers we know and have connected to before.
+/// # Note: This functions is potentially long running, and should not be run in a context where you
+/// don't want to block.
 pub async fn handle_event(
    event: ServiceEvent, endpoint: Endpoint, discovered_services: Arc<Mutex<HashSet<String>>>,
 ) -> std::result::Result<(), EventError> {
-   use ConnectError::InvalidRemoteAddress;
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
    use ServiceEvent::{ServiceRemoved, ServiceResolved};
 
    match event {
       ServiceResolved(info) => {
          let hostname = info.get_hostname();
+
          let fullname = info.get_fullname();
+
          let port = info.get_port();
+
          let peer_id = info
             .txt_properties
             .get("peer_id")
             .map(|v| v.val_str())
             .ok_or(NoPeerId)?;
+
          let version = info
             .txt_properties
             .get("version")
             .map(|v| v.val_str())
             .ok_or(UnsupportedVersion)?;
+
          if peer_id.len() != HEX_ENCODED_PEER_ID_LENGTH {
             tracing::warn!("peer id is not the correct length {peer_id:?}");
             return Ok(());
          }
-         // this is asserted on debug and is checked on release
-         debug_assert!(
-            fullname.ends_with(SERVICE_TYPE),
-            "fullname must end with service type. We should only be receiving service events for our service type."
-         );
-
-         #[cfg(not(debug_assertions))]
          if !fullname.ends_with(SERVICE_TYPE) {
             return Err(InvalidFullname);
          }
@@ -89,43 +134,18 @@ pub async fn handle_event(
          if !is_known {
             return Ok(());
          }
+         // make it a owned copy to avoid borrowing issues
+         let addresses = info.get_addresses().to_owned();
 
-         for addr in info.get_addresses() {
-            #[cfg(not(test))]
-            let is_valid = (addr.is_ipv4() || addr.is_ipv6()) && !addr.is_loopback();
+         let mut connection = find_valid_connect_path(&endpoint, addresses, hostname, port)
+            .await?
+            .ok_or(NoValidConnectionPath(fullname.to_string()))?;
 
-            // easiest way to test is to allow loopback in tests only
-            #[cfg(test)]
-            let is_valid = (addr.is_ipv4() || addr.is_ipv6());
-
-            if !is_valid {
-               continue;
-            }
-
-            let ip_addr = addr.to_ip_addr();
-            let socket_addr = SocketAddr::new(ip_addr, port);
-            tracing::debug!("Attempting to connect to {socket_addr:?} with peer id {peer_id:?}");
-
-            match endpoint.connect(socket_addr, hostname) {
-               Ok(connection) => {
-                  let mut connection = connection.await?;
-                  if let Err(error) = authenticate_client_side(&mut connection).await {
-                     tracing::error!("Failed to authenticate self to peer: {error:?}");
-                     return Ok(());
-                  }
-                  tracing::debug!("Connected to {fullname}");
-                  discovered_services.lock().await.insert(fullname.to_owned());
-                  return Ok(());
-               }
-
-               Err(InvalidRemoteAddress(addr)) => {
-                  tracing::debug!("Invalid remote address {addr:?}");
-                  continue;
-               }
-
-               Err(err) => return Err(err.into()),
-            }
+         if let Err(error) = authenticate_client_side(&mut connection).await {
+            tracing::warn!("Authentication handshake failed: {error:?}");
          }
+
+         todo!("handle the connection");
       }
 
       ServiceRemoved(service_type, fullname) => {
@@ -156,7 +176,7 @@ pub async fn advertise_local_client(
    );
    let peer_id = peer_id.to_string();
 
-   let service_daemon = task::spawn_blocking(move || {
+   task::spawn_blocking(move || {
       let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
       // load the address from the environment variable or default to auto assigned
       let address = socket_adrr.ip().to_string();
@@ -180,9 +200,7 @@ pub async fn advertise_local_client(
    })
    .await
    .expect("Thread unexpectedly panicked")
-   .expect("Failed to create mdns service daemon");
-
-   service_daemon
+   .expect("Failed to create mdns service daemon")
 }
 
 #[cfg(test)]
