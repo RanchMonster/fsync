@@ -1,5 +1,5 @@
 mod error;
-mod p2p_auth;
+pub mod p2p_auth;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use p2p_auth::AuthError;
 use quinn::Endpoint;
