@@ -68,6 +68,7 @@ async fn test_sync_logic() {
       );
    }
    fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
+   tokio::time::sleep(std::time::Duration::from_millis(100)).await;
    if let Ok(events) = sub.recv().await {
       assert!(
          events
