@@ -139,3 +139,18 @@ pub fn open_file_clone(path: &Path) -> std::io::Result<File> {
       Err(Unsupported.into())
    }
 }
+
+#[ignore = "Doesn't work on all filesystems"]
+#[test]
+fn test_cow_file() {
+   let src = std::env::temp_dir().join("src.txt");
+   let dst = std::env::temp_dir().join("dst.txt");
+   std::fs::write(&src, "Hello World!").expect("Failed to write to source file");
+   open_file_clone(&src).expect("Failed to clone file");
+   let src_contents = std::fs::read(&src).expect("Failed to read source file");
+   let dst_contents = std::fs::read(&dst).expect("Failed to read destination file");
+   assert_eq!(
+      src_contents, dst_contents,
+      "Source and destination files are not the same"
+   );
+}
