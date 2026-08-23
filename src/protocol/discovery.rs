@@ -4,7 +4,7 @@ use crate::protocol::p2p_auth::AuthError;
 use super::p2p_auth::{authenticate_client_side, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use hex::FromHexError;
-use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use thiserror::Error;
@@ -34,6 +34,50 @@ pub enum EventError {
    InvalidFullname,
    #[error("Failed to find a valid connection path for {0}")]
    NoValidConnectionPath(String),
+}
+
+/// Container for the relevant information from a service resolved event.
+pub struct ServiceResolvedInfo<'a> {
+   hostname: &'a str,
+   fullname: &'a str,
+   port: u16,
+   peer_id: &'a str,
+   version: &'a str,
+   addresses: HashSet<ScopedIp>,
+}
+
+/// Simple method to extract the relevant information from a service resolved
+/// event.
+fn extract_service_resolved_info<'a>(
+   info: &'a ResolvedService,
+) -> Result<ServiceResolvedInfo, EventError> {
+   use EventError::{NoPeerId, UnsupportedVersion};
+
+   let hostname = info.get_hostname();
+   let fullname = info.get_fullname();
+   let port = info.get_port();
+
+   let peer_id = info
+      .txt_properties
+      .get("peer_id")
+      .map(|v| v.val_str())
+      .ok_or(NoPeerId)?;
+
+   let version = info
+      .txt_properties
+      .get("version")
+      .map(|v| v.val_str())
+      .ok_or(UnsupportedVersion)?;
+   let addresses = info.get_addresses().to_owned();
+
+   Ok(ServiceResolvedInfo {
+      hostname,
+      fullname,
+      port,
+      peer_id,
+      version,
+      addresses,
+   })
 }
 
 type Result<T, E = EventError> = std::result::Result<T, E>;
@@ -83,78 +127,72 @@ pub async fn handle_event(
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
    use ServiceEvent::{ServiceRemoved, ServiceResolved};
 
+   async fn is_known_peer_(peer_id: &str) -> Result<bool> {
+      let peer_id: [u8; 32] = hex::decode(peer_id)
+         .map_err(InvalidPeerId)?
+         .try_into()
+         .map_err(|_| InvalidPeerId(FromHexError::InvalidStringLength))?;
+      Ok(task::spawn_blocking(move || is_known_peer(&peer_id))
+         .await
+         .expect("Thread unexpectedly panicked"))
+   }
+
    match event {
-      ServiceResolved(info) => {
-         let hostname = info.get_hostname();
-
-         let fullname = info.get_fullname();
-
-         let port = info.get_port();
-
-         let peer_id = info
-            .txt_properties
-            .get("peer_id")
-            .map(|v| v.val_str())
-            .ok_or(NoPeerId)?;
-
-         let version = info
-            .txt_properties
-            .get("version")
-            .map(|v| v.val_str())
-            .ok_or(UnsupportedVersion)?;
-
-         if peer_id.len() != HEX_ENCODED_PEER_ID_LENGTH {
-            tracing::warn!("peer id is not the correct length {peer_id:?}");
-            return Ok(());
-         }
-         if !fullname.ends_with(SERVICE_TYPE) {
-            return Err(InvalidFullname);
-         }
-
-         if discovered_services.lock().await.contains(fullname) {
-            tracing::debug!("Discovered service already connected to {fullname}");
-            return Ok(());
-         }
-         let is_compatible = version == VERSION_NUMBER;
-
-         if !is_compatible {
-            Err(UnsupportedVersion)?;
-         }
-
-         let is_known = {
-            let peer_id: [u8; 32] = hex::decode(peer_id)
-               .map_err(InvalidPeerId)?
-               .try_into()
-               .map_err(|_| InvalidPeerId(FromHexError::InvalidStringLength))?;
-            task::spawn_blocking(move || is_known_peer(&peer_id))
-               .await
-               .expect("Thread unexpectedly panicked")
-         };
-
-         if !is_known {
-            return Ok(());
-         }
-         // make it a owned copy to avoid borrowing issues
-         let addresses = info.get_addresses().to_owned();
-
-         let mut connection = find_valid_connect_path(&endpoint, addresses, hostname, port)
-            .await?
-            .ok_or(NoValidConnectionPath(fullname.to_string()))?;
-
-         if let Err(error) = authenticate_client_side(&mut connection).await {
-            tracing::warn!("Authentication handshake failed: {error:?}");
-         }
-
-         todo!("handle the connection");
-      }
-
       ServiceRemoved(service_type, fullname) => {
          assert_eq!(
             service_type, SERVICE_TYPE,
             "We should only be receiving service events for our service type"
          );
+
          tracing::info!("Service {fullname} no longer advertised");
          discovered_services.lock().await.remove(&fullname);
+      }
+      ServiceResolved(info) => {
+         // Pull necessary info from the resolved service event
+         let ServiceResolvedInfo {
+            hostname,
+            fullname,
+            port,
+            peer_id,
+            version,
+            addresses,
+         } = extract_service_resolved_info(&info)?;
+
+         {
+            if peer_id.len() != HEX_ENCODED_PEER_ID_LENGTH {
+               tracing::warn!("peer id is not the correct length {peer_id:?}");
+               return Ok(());
+            }
+
+            if !fullname.ends_with(SERVICE_TYPE) {
+               return Err(InvalidFullname);
+            }
+
+            if discovered_services.lock().await.contains(fullname) {
+               tracing::debug!("Discovered service already connected to {fullname}");
+               return Ok(());
+            }
+
+            if version != VERSION_NUMBER {
+               return Err(UnsupportedVersion);
+            }
+
+            if !is_known_peer_(peer_id).await? {
+               return Ok(());
+            }
+         }
+
+         let mut connection = find_valid_connect_path(&endpoint, addresses, hostname, port)
+            .await?
+            .ok_or(NoValidConnectionPath(fullname.to_string()))?;
+
+         authenticate_client_side(&mut connection)
+            .await
+            .inspect_err(|err| {
+               tracing::warn!("Authentication handshake failed: {err:?}");
+            });
+
+         todo!("handle the connection");
       }
       _ => {}
    }
