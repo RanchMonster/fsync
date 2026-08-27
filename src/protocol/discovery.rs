@@ -37,19 +37,19 @@ pub enum EventError {
 }
 
 /// Container for the relevant information from a service resolved event.
-pub struct ServiceResolvedInfo<'a> {
-   hostname: &'a str,
-   fullname: &'a str,
+pub struct ServiceResolvedInfo<'boxed_info> {
+   hostname: &'boxed_info str,
+   fullname: &'boxed_info str,
    port: u16,
-   peer_id: &'a str,
-   version: &'a str,
+   peer_id: &'boxed_info str,
+   version: &'boxed_info str,
    addresses: HashSet<ScopedIp>,
 }
 
 /// Simple method to extract the relevant information from a service resolved
 /// event.
-fn extract_service_resolved_info<'a>(
-   info: &'a ResolvedService,
+fn extract_service_resolved_info<'boxed_info>(
+   info: &'boxed_info ResolvedService,
 ) -> Result<ServiceResolvedInfo, EventError> {
    use EventError::{NoPeerId, UnsupportedVersion};
 
@@ -82,6 +82,8 @@ fn extract_service_resolved_info<'a>(
 
 type Result<T, E = EventError> = std::result::Result<T, E>;
 
+// Later when we do like path routing, for finding the best/fastest path to a peer, I think we
+// should keep this function as the main entry point for that logic.
 async fn find_valid_connect_path<I>(
    endpoint: &Endpoint, addresses: I, hostname: &str, port: u16,
 ) -> Result<Option<Connection>>
@@ -116,6 +118,7 @@ where
    }
    Ok(None)
 }
+
 /// Handles a service event from the mdns daemon.
 /// This function is responsible for handling mdns events and connecting to
 /// peers we know and have connected to before.
