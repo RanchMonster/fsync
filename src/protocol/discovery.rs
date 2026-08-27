@@ -446,7 +446,11 @@ mod tests {
          VERSION_NUMBER,
       );
       let result = handle_event(event, endpoint, discovered.clone()).await;
-      assert!(result.is_ok());
+
+      assert!(
+         matches!(result, Err(EventError::InvalidPeerId(_))),
+         "Peer id should be invalid because it is too short"
+      );
       assert!(discovered.lock().await.is_empty());
    }
 
