@@ -49,10 +49,10 @@ pub fn clone_file_cow<P: AsRef<Path> + std::fmt::Debug>(src: P, dst: P) -> std::
          0,
          &mut bytes_returned,
          std::ptr::null_mut(),
-      )
+      ) != 0
    };
 
-   if success == 0 {
+   if success == false {
       return Err(Error::last_os_error());
    }
 
