@@ -55,8 +55,8 @@ pub enum AuthError {
    NoPeerIdentity,
    #[error("peer identity is not a valid certificate(s)")]
    InvalidPeerIdentity,
-   #[error("failed to check known peers")]
-   KnownPeersCheckFailed(#[source] JoinError),
+   #[error("failed to open known peers file")]
+   KnownPeersCheckFailed(#[source] std::io::Error),
    #[error("peer is not a known peer")]
    UnknownPeer,
    #[error("Received invalid pairing mode from peer")]
@@ -115,7 +115,7 @@ impl AuthCommands {
 }
 
 /// A peer identity: the blake3 hash of a peer certificate's public key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct PeerId(pub [u8; 32]);
 
 impl FromStr for PeerId {
@@ -142,40 +142,52 @@ impl Display for PeerId {
 ///
 /// Panics if the file exists but cannot be opened, or if more than ten
 /// lines are empty, unparseable, or unreadable.
-pub fn is_known_peer(key_hash: &PeerId) -> bool {
-   use ErrorKind::NotFound;
-   let path = CONFIG_DIR.join("known_peers");
-   let file = match File::open(&path) {
-      Ok(file) => file,
-      Err(err) if err.kind() == NotFound => return false,
-      Err(err) => {
-         panic!("Failed to open known peers file {path:?}: {err}");
-      }
-   };
-   // number of faulty lines in the file breaks after 10
-   let known_peers_file = BufReader::new(file);
-   let mut bad_line_count = 0;
-   for line in known_peers_file.lines() {
-      if bad_line_count > 10 {
-         panic!("Known peers file {path:?} is corrupted");
-      }
-      let Ok(line) = line else {
-         bad_line_count += 1;
-         continue;
+pub async fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
+   use AuthError::KnownPeersCheckFailed;
+   fn sync_check_logic(connecting_peer_id: PeerId) -> Result<bool> {
+      use ErrorKind::NotFound;
+      let path = CONFIG_DIR.join("known_peers");
+      let file = match File::open(&path) {
+         Ok(file) => file,
+         Err(err) => {
+            if err.kind() == NotFound {
+               tracing::warn!(
+                  known_peers_file =% path.display(),
+                  error =% err,
+                  "Know peers file doesn't exist"
+               );
+               return Ok(false);
+            }
+            return Err(KnownPeersCheckFailed(err));
+         }
       };
-      if line.is_empty() {
-         bad_line_count += 1;
-         continue;
-      };
-      let Ok(peer) = PeerId::from_str(&line) else {
-         bad_line_count += 1;
-         continue;
-      };
-      if peer == *key_hash {
-         return true;
+      let known_peers_file = BufReader::new(file);
+      for line in known_peers_file.lines() {
+         let line = line.map_err(KnownPeersCheckFailed)?;
+
+         // I decide to simplify this to just print a warning and move on for now.
+         // I decided to do something else here I want to allow the program to keep running but also
+         // don't allow the corrupted file to continue to exist.
+         let Ok(stored_peer_id) = PeerId::from_str(&line) else {
+            #[cfg(debug_assertions)]
+            {
+               tracing::warn!(bad_line=%line,known_peers_file_path=%path.display(),"The known peers file is corupted");
+               continue;
+            }
+            #[cfg(not(debug_assertions))]
+            todo!("Find a better way to handle invalid file state");
+         };
+         if stored_peer_id == connecting_peer_id {
+            return Ok(true);
+         }
       }
+      Ok(false)
    }
-   false
+
+   let peer_id = *peer_id;
+   task::spawn_blocking(move || sync_check_logic(peer_id))
+      .await
+      .expect("Thread paniced unexpectedly while attempting to check known peer file")
 }
 
 /// Represents the pairing mode of this device: how the server side handles a
@@ -212,25 +224,34 @@ impl Display for PairMode {
 
 /// Records the given peer in the known peers list, appending it if it is not
 /// already present.
-fn add_known_peer(peer: PeerId) -> Result<(), std::io::Error> {
-   if is_known_peer(&peer) {
+async fn add_known_peer(peer: PeerId) -> Result<()> {
+   use AuthError::KnownPeersCheckFailed;
+
+   fn sync_inner(peer: PeerId) -> Result<(), std::io::Error> {
+      let mut file = File::options()
+         .read(true)
+         .append(true)
+         .create(true)
+         .open(CONFIG_DIR.join("known_peers"))?;
+      if file.metadata()?.len() > 0 {
+         file.seek(SeekFrom::End(-1))?;
+         let mut last_char = [0];
+         file.read_exact(&mut last_char)?;
+         if last_char[0] != b'\n' {
+            file.write_all(b"\n")?;
+         }
+      }
+      writeln!(file, "{}", peer)?;
+      Ok(())
+   }
+
+   if is_known_peer(&peer).await? {
       return Ok(());
    }
-   let mut file = File::options()
-      .read(true)
-      .append(true)
-      .create(true)
-      .open(CONFIG_DIR.join("known_peers"))?;
-   if file.metadata()?.len() > 0 {
-      file.seek(SeekFrom::End(-1))?;
-      let mut last_char = [0];
-      file.read_exact(&mut last_char)?;
-      if last_char[0] != b'\n' {
-         file.write_all(b"\n")?;
-      }
-   }
-   writeln!(file, "{}", peer)?;
-   Ok(())
+   task::spawn_blocking(move || sync_inner(peer))
+      .await
+      .expect("Thread unexpectedly panicked")
+      .map_err(KnownPeersCheckFailed)
 }
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
@@ -268,11 +289,8 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use AuthError::{KnownPeersCheckFailed, UnknownPeer};
    let peer_id = peer_key_hash(connection)?;
-   let is_known = task::spawn_blocking(move || is_known_peer(&peer_id))
-      .await
-      .map_err(KnownPeersCheckFailed)?;
-   if !is_known {
-      return Err(UnknownPeer);
+   if !is_known_peer(&peer_id).await? {
+      return Err(UnknownPeer.into());
    }
    Ok(())
 }
@@ -480,10 +498,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
       }
    }
    let peer_id = peer_key_hash(connection)?;
-   task::spawn_blocking(move || add_known_peer(peer_id))
-      .await
-      .expect("Thread unexpectedly panicked")
-      .map_err(FailedToRegisterPeer)?;
+   add_known_peer(peer_id).await?;
    Ok(())
 }
 
@@ -638,8 +653,8 @@ mod tests {
       assert_eq!(peer, prased_key);
    }
 
-   #[test]
-   fn test_is_known_peers_found() {
+   #[tokio::test]
+   async fn test_is_known_peers_found() {
       let _guard = KNOWN_PEERS_LOCK
          .lock()
          .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -652,30 +667,43 @@ mod tests {
       );
       std::fs::write(&path, contents).expect("failed to write known peers file");
       assert!(
-         is_known_peer(&known_key),
+         is_known_peer(&known_key)
+            .await
+            .expect("Failed to check if peer was known"),
          "Test Peer id {known_key} was not found"
       );
       assert!(
-         is_known_peer(&other_key),
+         is_known_peer(&other_key)
+            .await
+            .expect("Failed to check if peer was known"),
          "Test Peer id {other_key} was not found"
       );
       let bad_peer_id = PeerId(random::<[u8; 32]>());
       // I am dumb but I feel like there should be a better way to say that asset message
       assert!(
-         !is_known_peer(&bad_peer_id),
+         !is_known_peer(&bad_peer_id)
+            .await
+            .expect("Failed to check if peer was known"),
          "Test Peer id {bad_peer_id} was marked as valid when it should have been marked as invalid"
       );
       let _ = std::fs::remove_file(&path);
    }
 
-   #[test]
-   fn test_is_known_peers_missing_file() {
+   #[tokio::test]
+   async fn test_is_known_peers_missing_file() {
       let _guard = KNOWN_PEERS_LOCK
          .lock()
          .unwrap_or_else(|poisoned| poisoned.into_inner());
+
       let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
       let peer_id = PeerId(random::<[u8; 32]>());
-      assert!(!is_known_peer(&peer_id));
+
+      assert!(
+         !is_known_peer(&peer_id)
+            .await
+            .expect("Failed to check if peer was known"),
+         "Test Peer id {peer_id} was marked as valid when it should have been marked as invalid"
+      )
    }
 
    async fn connecting_peer(connect_attempt: Connecting) {
