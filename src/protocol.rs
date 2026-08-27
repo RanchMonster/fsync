@@ -1,14 +1,12 @@
 mod discovery;
 mod error;
 pub mod p2p_auth;
-use discovery::{EventError, advertise_local_client, handle_event};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use discovery::{advertise_local_client, handle_event};
 use p2p_auth::AuthError;
-use p2p_auth::{PairMode, authenticate_client_side, configure_server, handle_incoming};
-use quinn::{ConnectError, ConnectionError, Endpoint};
+use p2p_auth::{PairMode, configure_server, handle_incoming};
+use quinn::Endpoint;
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::{collections::HashSet, net::SocketAddr};
-use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::{self};
 

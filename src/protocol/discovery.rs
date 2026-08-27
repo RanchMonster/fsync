@@ -3,7 +3,6 @@ use crate::protocol::p2p_auth::{AuthError, PeerId};
 
 use super::p2p_auth::{authenticate_client_side, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
-use hex::FromHexError;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
 use std::str::FromStr;
@@ -51,7 +50,7 @@ pub struct ServiceResolvedInfo<'boxed_info> {
 /// event.
 fn extract_service_resolved_info<'boxed_info>(
    info: &'boxed_info ResolvedService,
-) -> Result<ServiceResolvedInfo, EventError> {
+) -> Result<ServiceResolvedInfo<'boxed_info>, EventError> {
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
 
    let hostname = info.get_hostname();
@@ -129,7 +128,7 @@ where
 pub async fn handle_event(
    event: ServiceEvent, endpoint: Endpoint, discovered_services: Arc<Mutex<HashSet<String>>>,
 ) -> std::result::Result<(), EventError> {
-   use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
+   use EventError::UnsupportedVersion;
    use ServiceEvent::{ServiceRemoved, ServiceResolved};
 
    match event {
