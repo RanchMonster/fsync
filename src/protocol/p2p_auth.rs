@@ -287,7 +287,7 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 ///
 /// Returns [`AuthError`] if the peer is not a known peer.
 pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
-   use AuthError::{KnownPeersCheckFailed, UnknownPeer};
+   use AuthError::UnknownPeer;
    let peer_id = peer_key_hash(connection)?;
    if !is_known_peer(&peer_id).await? {
       return Err(UnknownPeer.into());
@@ -435,8 +435,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
 /// stream or connection failures.
 async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
    use AuthError::{
-      EmptyPassword, FailedToRegisterPeer, KeyMismatch, PairingNotAllowed, PasswordRejected,
-      PasswordVerificationFailure,
+      EmptyPassword, KeyMismatch, PairingNotAllowed, PasswordRejected, PasswordVerificationFailure,
    };
    use PairMode::*;
    let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
