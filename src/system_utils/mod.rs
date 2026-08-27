@@ -24,6 +24,7 @@ pub struct TempFile {
    path: PathBuf,
    file: File,
 }
+
 impl TempFile {
    pub fn new() -> Result<Self> {
       use ErrorKind::AlreadyExists;
