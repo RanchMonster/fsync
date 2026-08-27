@@ -1,11 +1,12 @@
 use crate::protocol::discovery::EventError::{InvalidFullname, NoValidConnectionPath};
-use crate::protocol::p2p_auth::AuthError;
+use crate::protocol::p2p_auth::{AuthError, PeerId};
 
 use super::p2p_auth::{authenticate_client_side, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use hex::FromHexError;
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
+use std::str::FromStr;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -41,7 +42,7 @@ pub struct ServiceResolvedInfo<'boxed_info> {
    hostname: &'boxed_info str,
    fullname: &'boxed_info str,
    port: u16,
-   peer_id: &'boxed_info str,
+   peer_id: PeerId,
    version: &'boxed_info str,
    addresses: HashSet<ScopedIp>,
 }
@@ -51,7 +52,7 @@ pub struct ServiceResolvedInfo<'boxed_info> {
 fn extract_service_resolved_info<'boxed_info>(
    info: &'boxed_info ResolvedService,
 ) -> Result<ServiceResolvedInfo, EventError> {
-   use EventError::{NoPeerId, UnsupportedVersion};
+   use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
 
    let hostname = info.get_hostname();
    let fullname = info.get_fullname();
@@ -60,8 +61,9 @@ fn extract_service_resolved_info<'boxed_info>(
    let peer_id = info
       .txt_properties
       .get("peer_id")
-      .map(|v| v.val_str())
-      .ok_or(NoPeerId)?;
+      .map(|v| PeerId::from_str(v.val_str()))
+      .ok_or(NoPeerId)?
+      .map_err(InvalidPeerId)?;
 
    let version = info
       .txt_properties
@@ -130,16 +132,6 @@ pub async fn handle_event(
    use EventError::{InvalidPeerId, NoPeerId, UnsupportedVersion};
    use ServiceEvent::{ServiceRemoved, ServiceResolved};
 
-   async fn is_known_peer_(peer_id: &str) -> Result<bool> {
-      let peer_id: [u8; 32] = hex::decode(peer_id)
-         .map_err(InvalidPeerId)?
-         .try_into()
-         .map_err(|_| InvalidPeerId(FromHexError::InvalidStringLength))?;
-      Ok(task::spawn_blocking(move || is_known_peer(&peer_id))
-         .await
-         .expect("Thread unexpectedly panicked"))
-   }
-
    match event {
       ServiceRemoved(service_type, fullname) => {
          assert_eq!(
@@ -162,11 +154,6 @@ pub async fn handle_event(
          } = extract_service_resolved_info(&info)?;
 
          {
-            if peer_id.len() != HEX_ENCODED_PEER_ID_LENGTH {
-               tracing::warn!("peer id is not the correct length {peer_id:?}");
-               return Ok(());
-            }
-
             if !fullname.ends_with(SERVICE_TYPE) {
                return Err(InvalidFullname);
             }
@@ -180,7 +167,7 @@ pub async fn handle_event(
                return Err(UnsupportedVersion);
             }
 
-            if !is_known_peer_(peer_id).await? {
+            if !is_known_peer(&peer_id).await? {
                return Ok(());
             }
          }

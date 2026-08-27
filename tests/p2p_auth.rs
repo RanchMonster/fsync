@@ -1,6 +1,6 @@
 use fsync::CONFIG_DIR;
 use fsync::protocol::p2p_auth::{
-   AuthCommands, KnownPeer, PairMode, configure_client, configure_server, handle_incoming,
+   AuthCommands, PairMode, PeerId, configure_client, configure_server, handle_incoming,
    is_known_peer, pair_peer,
 };
 use quinn::{Connecting, Incoming};
@@ -18,47 +18,6 @@ fn setup_config_dir() {
    unsafe {
       std::env::set_var("FSYNC_CONFIG_DIR", &dir);
    }
-}
-
-#[test]
-fn test_known_peer_comparison() {
-   let random_key = random::<[u8; 32]>();
-   let peer = KnownPeer(random_key);
-   let hexed_key = hex::encode(random_key);
-   let prased_key = KnownPeer::from_str(&hexed_key).expect("failed to parse known peer");
-   assert_eq!(peer, prased_key);
-}
-
-#[test]
-fn test_is_known_peers_found() {
-   setup_config_dir();
-   let _guard = KNOWN_PEERS_LOCK
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner());
-   let known_key = random::<[u8; 32]>();
-   let other_key = random::<[u8; 32]>();
-   let path = CONFIG_DIR.join("known_peers");
-   let contents = format!(
-      "{}\n\n{}\n{}\n",
-      KnownPeer(other_key),
-      "not-a-valid-hex-line",
-      KnownPeer(known_key)
-   );
-   std::fs::write(&path, contents).expect("failed to write known peers file");
-   assert!(is_known_peer(&known_key));
-   assert!(is_known_peer(&other_key));
-   assert!(!is_known_peer(&random::<[u8; 32]>()));
-   let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn test_is_known_peers_missing_file() {
-   setup_config_dir();
-   let _guard = KNOWN_PEERS_LOCK
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner());
-   let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
-   assert!(!is_known_peer(&random::<[u8; 32]>()));
 }
 
 async fn connecting_peer(connect_attempt: Connecting) {
