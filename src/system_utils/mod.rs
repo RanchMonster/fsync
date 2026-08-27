@@ -41,14 +41,8 @@ impl TempFile {
 
          match result {
             Ok(file) => return Ok(Self { path, file }),
-
-            Err(err) => {
-               if err.kind() == AlreadyExists {
-                  continue;
-               }
-
-               return Err(err);
-            }
+            Err(err) if err.kind() == AlreadyExists => { continue; }
+            Err(err) => { return Err(err); }
          }
       }
    }
