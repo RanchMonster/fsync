@@ -116,19 +116,19 @@ impl AuthCommands {
 
 /// A peer identity: the blake3 hash of a peer certificate's public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct KnownPeer(pub [u8; 32]);
+pub struct PeerId(pub [u8; 32]);
 
-impl FromStr for KnownPeer {
+impl FromStr for PeerId {
    type Err = hex::FromHexError;
    fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
       let key_hash = hex::decode(line)?
          .try_into()
          .map_err(|_| hex::FromHexError::InvalidStringLength)?;
-      Ok(KnownPeer(key_hash))
+      Ok(PeerId(key_hash))
    }
 }
 
-impl Display for KnownPeer {
+impl Display for PeerId {
    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
       write!(f, "{}", hex::encode(self.0))
    }
@@ -142,8 +142,7 @@ impl Display for KnownPeer {
 ///
 /// Panics if the file exists but cannot be opened, or if more than ten
 /// lines are empty, unparseable, or unreadable.
-#[instrument]
-pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
+pub fn is_known_peer(key_hash: &PeerId) -> bool {
    use ErrorKind::NotFound;
    let path = CONFIG_DIR.join("known_peers");
    let file = match File::open(&path) {
@@ -168,11 +167,11 @@ pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
          bad_line_count += 1;
          continue;
       };
-      let Ok(peer) = KnownPeer::from_str(&line) else {
+      let Ok(peer) = PeerId::from_str(&line) else {
          bad_line_count += 1;
          continue;
       };
-      if peer.0 == *key_hash {
+      if peer == *key_hash {
          return true;
       }
    }
@@ -213,8 +212,8 @@ impl Display for PairMode {
 
 /// Records the given peer in the known peers list, appending it if it is not
 /// already present.
-fn add_known_peer(peer: KnownPeer) -> Result<(), std::io::Error> {
-   if is_known_peer(&peer.0) {
+fn add_known_peer(peer: PeerId) -> Result<(), std::io::Error> {
+   if is_known_peer(&peer) {
       return Ok(());
    }
    let mut file = File::options()
@@ -242,7 +241,7 @@ fn add_known_peer(peer: KnownPeer) -> Result<(), std::io::Error> {
 /// Returns [`AuthError`] if the connection has no peer identity or the
 /// identity is not a valid certificate chain.
 #[instrument(skip(connection))]
-fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
+fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
    use AuthError::{InvalidPeerIdentity, NoPeerIdentity};
    let identity = connection.peer_identity().ok_or(NoPeerIdentity)?;
 
@@ -256,7 +255,8 @@ fn peer_key_hash(connection: &Connection) -> Result<[u8; 32]> {
       x509_parser::parse_x509_certificate(peer_cert).map_err(|_| InvalidPeerIdentity)?;
 
    let public_key = x509_cert.public_key().raw;
-   Ok(*blake3::hash(public_key).as_bytes())
+   let public_key_hash = *blake3::hash(public_key).as_bytes();
+   Ok(PeerId(public_key_hash))
 }
 
 /// Authenticates a peer that claims to be known to us by checking its key
@@ -480,7 +480,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
       }
    }
    let peer_id = peer_key_hash(connection)?;
-   task::spawn_blocking(move || add_known_peer(KnownPeer(peer_id)))
+   task::spawn_blocking(move || add_known_peer(peer_id))
       .await
       .expect("Thread unexpectedly panicked")
       .map_err(FailedToRegisterPeer)?;
@@ -632,9 +632,9 @@ mod tests {
    #[test]
    fn test_known_peer_comparison() {
       let random_key = random::<[u8; 32]>();
-      let peer = KnownPeer(random_key);
+      let peer = PeerId(random_key);
       let hexed_key = hex::encode(random_key);
-      let prased_key = KnownPeer::from_str(&hexed_key).expect("failed to parse known peer");
+      let prased_key = PeerId::from_str(&hexed_key).expect("failed to parse known peer");
       assert_eq!(peer, prased_key);
    }
 
@@ -643,19 +643,28 @@ mod tests {
       let _guard = KNOWN_PEERS_LOCK
          .lock()
          .unwrap_or_else(|poisoned| poisoned.into_inner());
-      let known_key = random::<[u8; 32]>();
-      let other_key = random::<[u8; 32]>();
+      let known_key = PeerId(random::<[u8; 32]>());
+      let other_key = PeerId(random::<[u8; 32]>());
       let path = CONFIG_DIR.join("known_peers");
       let contents = format!(
          "{}\n\n{}\n{}\n",
-         KnownPeer(other_key),
-         "not-a-valid-hex-line",
-         KnownPeer(known_key)
+         other_key, "not-a-valid-hex-line", known_key,
       );
       std::fs::write(&path, contents).expect("failed to write known peers file");
-      assert!(is_known_peer(&known_key));
-      assert!(is_known_peer(&other_key));
-      assert!(!is_known_peer(&random::<[u8; 32]>()));
+      assert!(
+         is_known_peer(&known_key),
+         "Test Peer id {known_key} was not found"
+      );
+      assert!(
+         is_known_peer(&other_key),
+         "Test Peer id {other_key} was not found"
+      );
+      let bad_peer_id = PeerId(random::<[u8; 32]>());
+      // I am dumb but I feel like there should be a better way to say that asset message
+      assert!(
+         !is_known_peer(&bad_peer_id),
+         "Test Peer id {bad_peer_id} was marked as valid when it should have been marked as invalid"
+      );
       let _ = std::fs::remove_file(&path);
    }
 
@@ -665,7 +674,8 @@ mod tests {
          .lock()
          .unwrap_or_else(|poisoned| poisoned.into_inner());
       let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
-      assert!(!is_known_peer(&random::<[u8; 32]>()));
+      let peer_id = PeerId(random::<[u8; 32]>());
+      assert!(!is_known_peer(&peer_id));
    }
 
    async fn connecting_peer(connect_attempt: Connecting) {
