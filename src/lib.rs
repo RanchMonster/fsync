@@ -1,5 +1,6 @@
 pub mod fs_watcher;
 pub mod protocol;
+mod sync;
 
 use blake3::Hash;
 use std::{

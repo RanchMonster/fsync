@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use async_trait::async_trait;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,6 @@ pub struct Event {
 }
 
 #[async_trait]
-trait EventStream<E: SyncError> {
+pub trait EventStream<E: SyncError> {
    async fn next(&mut self) -> Result<Option<Event>, E>;
 }
