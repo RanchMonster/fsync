@@ -1,7 +1,6 @@
 pub mod config;
 pub mod fs_watcher;
 pub mod protocol;
-use blake3::Hash;
 use std::{
    fs::create_dir_all,
    path::{Path, PathBuf},
@@ -26,7 +25,3 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
    }
    path
 });
-
-pub async fn hash_file(_path: &Path) -> Result<Hash, std::io::Error> {
-   todo!("hash the file")
-}
