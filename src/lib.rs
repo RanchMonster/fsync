@@ -25,7 +25,7 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
 
 pub fn start_fsync() -> ! {
    // Leak the config so it lives as long as the process does
-   let config = todo!("read config");
+   let config = Box::leak(Box::new(Config::load().expect("Failed to load config")));
 
    let worker_count = config.workers.get();
    tracing::info!("Using {worker_count} worker threads");
