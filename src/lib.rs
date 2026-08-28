@@ -1,6 +1,6 @@
+pub mod config;
 pub mod fs_watcher;
 pub mod protocol;
-
 use blake3::Hash;
 use std::{
    fs::create_dir_all,
