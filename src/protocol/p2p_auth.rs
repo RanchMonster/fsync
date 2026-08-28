@@ -290,7 +290,7 @@ pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use AuthError::UnknownPeer;
    let peer_id = peer_key_hash(connection)?;
    if !is_known_peer(&peer_id).await? {
-      return Err(UnknownPeer.into());
+      return Err(UnknownPeer);
    }
    Ok(())
 }
