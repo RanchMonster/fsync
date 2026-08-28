@@ -240,7 +240,7 @@ fn load_password_hash(password_hash_file: &mut File) -> Result<PasswordHashStrin
       .read_to_string(&mut password_buffer)
       .map_err(FailedToReadPasswordHash)?;
    // So I wanted to pass the error up the stack but apparently argon2 doesn't implement error correctly or something so we aren't going to log it we can change it later if needed
-   PasswordHashString::from_str(&password_buffer).map_err(|_| PasswordIsCorrupted)
+   PasswordHashString::from_str(password_buffer.trim()).map_err(|_| PasswordIsCorrupted)
 }
 
 fn convert_to_pair_mode(pair_mode: &str, config_dir: &Path) -> Result<PairMode, ConfigError> {
