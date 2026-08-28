@@ -20,9 +20,12 @@ fsync is a decentralized peer-to-peer file synchronization system. Devices on th
 ├──────────────────────────────────────────────────┤
 │  Transport Layer — QUIC (quinn)                  │
 │  ├── Streams (TCP-like, reliable, ordered)       │
-│  │   └── File transfers, state exchange          │
+│  │   ├── File transfers                          │
+│  │   ├── State exchange                          │
+│  │   └── Unidirectional streams:                 │
+│  │       └── "I have changes" notifications      │
 │  └── Datagrams (UDP-like, unreliable)            │
-│      └── "I have changes" notifications          │
+│      └── (reserved)                              │
 ├──────────────────────────────────────────────────┤
 │  Discovery Layer — mDNS (mdns-sd)                │
 │  └── Automatic LAN peer discovery                │
@@ -43,7 +46,7 @@ fsync is a decentralized peer-to-peer file synchronization system. Devices on th
 - [x] Ed25519 keypair for peer identity
 - [x] Self-signed TLS cert from keypair
 - [ ] Streams for file transfer
-- [ ] Datagrams for change notifications
+- [ ] Unidirectional streams for change notifications
 
 ### Phase 3: File Sync Protocol
 - [ ] Sync state exchange (vector clocks / timestamps)
@@ -89,16 +92,21 @@ Key is persisted to disk so the peer ID is stable across restarts.
 ### Why QUIC over raw TCP
 - Built-in TLS 1.3 (encryption + authentication)
 - Multiplexed streams (no head-of-line blocking)
-- Datagram support for lightweight notifications
+- Unidirectional streams for lightweight notifications
 - Single UDP socket for everything
 
 ### Streams vs Datagrams
-| Feature         | Streams (TCP-like)        | Datagrams (UDP-like)     |
-|-----------------|---------------------------|--------------------------|
-| Reliable        | Yes                       | No (can be dropped)      |
-| Ordered         | Yes                       | No                       |
-| Use case        | File transfers, state sync | "I have changes" pings   |
-| Flow control    | Yes                       | No                       |
+| Feature         | Streams (TCP-like)                          | Datagrams (UDP-like) |
+|-----------------|---------------------------------------------|----------------------|
+| Reliable        | Yes                                         | No (can be dropped)  |
+| Ordered         | Yes                                         | No                   |
+| Use case        | File transfers, state sync, change pings    | (reserved)           |
+| Flow control    | Yes                                         | No                   |
+
+Change notifications are sent over **unidirectional streams** — a sender
+opens a send-only stream to notify a peer it has changes, so notifications
+get reliability and ordering without needing to read a response on the same
+stream.
 
 ### Connection flow
 ```
