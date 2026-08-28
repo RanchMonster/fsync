@@ -32,7 +32,8 @@ pub fn start_fsync() -> ! {
 
    let rt = tokio::runtime::Builder::new_current_thread()
       .enable_all()
-      .worker_threads(worker_count)
+      .max_blocking_threads(worker_count)
+      .thread_name("fsync-worker")
       .build()
       .expect("Failed to build tokio runtime");
    rt.block_on(protocol::start_service(config));
