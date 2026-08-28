@@ -128,7 +128,7 @@ impl Into<ServiceConfigArgs> for Config {
 /// Writes the default config to the config file
 /// Precondition: Config file exists
 fn write_default_config(config_file: &mut File) {
-   let default_config = r#"
+   const DEFAULT_CONFIG: &str = r#"
         # The address to listen on
         address = "0.0.0.0"
         # The port to listen on
@@ -141,7 +141,7 @@ fn write_default_config(config_file: &mut File) {
         hostname = "fsync"
     "#;
 
-   let result = config_file.write(default_config.as_bytes());
+   let result = config_file.write(DEFAULT_CONFIG.as_bytes());
 
    if let Err(error) = result {
       if error.kind() == std::io::ErrorKind::PermissionDenied {
