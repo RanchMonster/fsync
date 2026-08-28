@@ -58,7 +58,7 @@ pub async fn start_service(config: &'static Config) -> ! {
             accept = endpoint.accept() => {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
-            match handle_incoming(incoming, &pair_mode).await {
+            match handle_incoming(incoming, pair_mode).await {
                 Ok(_connection) => tracing::debug!("Connection accepted, handling is not implemented yet"),
                 Err(err) => match err {
                     AuthError::Quic(quic_error) => tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}"),

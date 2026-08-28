@@ -7,7 +7,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use argon2::password_hash::PasswordHashString;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use thiserror::Error;
 use tracing::instrument;
 
@@ -164,7 +164,7 @@ impl Config {
          pair_mode,
       } = toml::from_str(&config_contents).map_err(Toml)?;
 
-      let pair_mode = convert_to_pair_mode(&pair_mode, &config_dir)?;
+      let pair_mode = convert_to_pair_mode(&pair_mode, config_dir)?;
 
       Ok(Config {
          port,
