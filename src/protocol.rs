@@ -7,37 +7,28 @@ use std::net::SocketAddr;
 use tokio::task::{self};
 
 pub use crate::protocol::p2p_auth::PairMode;
-use crate::protocol::p2p_auth::{configure_server, handle_incoming};
+use crate::{
+   Config,
+   protocol::p2p_auth::{configure_server, handle_incoming},
+};
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 
-// cleaner then a bunch of arguments
-pub struct ServiceConfigArgs {
-   pub address: String,
-   pub port: u16,
-   // this field is required
-   pub sync_dirs: Vec<String>,
-   pub pair_mode: PairMode,
-   pub hostname: String,
-   // add more as needed
-   // once we have figured out a config and put stuff togother more we will need to add this
-   // sync_dirs: todo!("whatever we use to represent sync dirs"),
-}
-pub async fn start_service(config_args: ServiceConfigArgs) -> ! {
+pub async fn start_service(config: &'static Config) -> ! {
    // load args from the config given
-   let hostname = config_args.hostname.clone();
+   let hostname = config.hostname.clone();
 
    assert!(!hostname.is_empty(), "Hostname cannot be empty");
    assert!(
       hostname.len() <= 15,
       "Hostname cannot be longer than 15 characters"
    );
-   let config_address = config_args.address;
-   let config_port = config_args.port;
-   let pair_mode = config_args.pair_mode;
+   let config_address = &config.address;
+   let config_port = config.port;
+   let pair_mode = &config.pair_mode;
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname).expect("Failed to configure server");

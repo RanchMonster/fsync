@@ -10,7 +10,8 @@ use thiserror::Error;
 use tracing::instrument;
 
 use crate::CONFIG_DIR;
-use crate::protocol::{PairMode, ServiceConfigArgs};
+use crate::protocol::PairMode;
+const FILE_START_POSITION: u64 = 0;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
