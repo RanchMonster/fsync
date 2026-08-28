@@ -32,12 +32,13 @@ fn default_hostname() -> String {
    }
    name
 }
+
 fn default_workers() -> NonZeroUsize {
    std::thread::available_parallelism().expect("Failed to get the number of available cores")
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ConfigIntermediary {
+pub struct Config {
    #[serde(default = "default_port")]
    pub port: u16,
    #[serde(default = "default_address")]
@@ -64,7 +65,7 @@ pub fn create_config_file() {
    write_default_config(&mut file);
 }
 
-impl Into<ServiceConfigArgs> for ConfigIntermediary {
+impl Into<ServiceConfigArgs> for Config {
    fn into(self) -> ServiceConfigArgs {
       let pair_mode = match self.pair_mode.as_str() {
          "STRICT" => PairMode::Strict,
@@ -131,7 +132,7 @@ fn write_default_config(config_file: &mut File) {
    }
 }
 
-fn read_config_file() -> ConfigIntermediary {
+fn read_config_file() -> Config {
    let config_file_path = CONFIG_DIR.join("config.toml");
 
    let mut config_file = File::open(config_file_path).expect("Failed to open config file");
