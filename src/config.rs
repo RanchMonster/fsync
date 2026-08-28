@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use argon2::password_hash::PasswordHashString;
@@ -31,6 +32,9 @@ fn default_hostname() -> String {
    }
    name
 }
+fn default_workers() -> NonZeroUsize {
+   std::thread::available_parallelism().expect("Failed to get the number of available cores")
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConfigIntermediary {
@@ -45,6 +49,9 @@ pub struct ConfigIntermediary {
 
    pub password: Option<String>,
    pub sync_dirs: Vec<String>,
+
+   #[serde(default = "default_workers")]
+   pub workers: NonZeroUsize,
 }
 
 pub fn create_config_file() {
