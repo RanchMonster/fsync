@@ -165,6 +165,12 @@ pub struct IgnoreMap {
    map: HashMap<PathBuf, Gitignore>,
 }
 
+impl Default for IgnoreMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IgnoreMap {
    pub fn is_ignore(&self, path: &Path) -> bool {
       assert!(path.is_absolute(), "Path must be absolute");
@@ -178,7 +184,7 @@ impl IgnoreMap {
                .expect("something went very wrong here");
 
             let should_ignore = ignore
-               .matched_path_or_any_parents(&path, path.is_dir())
+               .matched_path_or_any_parents(path, path.is_dir())
                .is_ignore();
 
             if should_ignore {
@@ -301,7 +307,7 @@ impl WatcherThread {
                }
 
                event.paths = paths;
-               assert!(event.paths.len() > 0, "Event must have at least one path");
+               assert!(!event.paths.is_empty(), "Event must have at least one path");
             }
 
             if event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove() {

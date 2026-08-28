@@ -89,7 +89,9 @@ async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> Se
       hostname.len() <= 15,
       "Hostname cannot be longer than 15 characters"
    );
-   let service_daemon = task::spawn_blocking(move || {
+   
+
+   task::spawn_blocking(move || {
       let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
       // load the address from the environment variable or default to auto assigned
       let address = socket_adrr.ip().to_string();
@@ -109,7 +111,5 @@ async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> Se
    })
    .await
    .expect("Thread unexpectedly panicked")
-   .expect("Failed to create mdns service daemon");
-
-   service_daemon
+   .expect("Failed to create mdns service daemon")
 }

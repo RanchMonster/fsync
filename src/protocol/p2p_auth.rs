@@ -179,12 +179,14 @@ pub fn is_known_peer(key_hash: &[u8; 32]) -> bool {
 /// `PAIR` request from an unknown peer. The `Display` form of the mode is what
 /// is announced to the pairing client over the wire. The default is
 /// [`PairMode::Relaxed`].
+#[derive(Default)]
 pub enum PairMode {
    /// Strict mode: a random key is generated and announced, and the other
    /// device must enter it to complete the pairing.
    Strict,
    /// Relaxed mode: other devices can connect without any confirmation from
    /// this device.
+   #[default]
    Relaxed,
    /// Password mode: other devices can connect to this device by providing
    /// the password whose hash is stored in this variant.
@@ -202,12 +204,6 @@ impl Display for PairMode {
          PairMode::Password(_) => write!(f, "PASSWORD"),
          PairMode::KeyOnly => write!(f, "KEYONLY"),
       }
-   }
-}
-impl Default for PairMode {
-   fn default() -> Self {
-      // for now, we default to relaxed mode
-      Self::Relaxed
    }
 }
 
@@ -272,7 +268,7 @@ pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
       .await
       .map_err(KnownPeersCheckFailed)?;
    if !is_known {
-      return Err(UnknownPeer.into());
+      return Err(UnknownPeer);
    }
    Ok(())
 }
@@ -332,7 +328,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          tracing::warn!("Timed out waiting for pairing response");
          return Ok(false);
       };
-      let _ = result?;
+      result?;
       Ok(response_buf == AuthCommands::ACCEPT)
    }
    /// Helper function to simplify the decoding of the pairing key
@@ -356,7 +352,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          let mut password_attempts = 0;
          loop {
             if password_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyPasswordAttempts.into());
+               return Err(TooManyPasswordAttempts);
             }
             let password = prompt_user("Password: ")
                .await
@@ -382,7 +378,7 @@ async fn pair_client_side(connection: &mut Connection) -> Result<()> {
          let mut key_attempts = 0;
          loop {
             if key_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyKeyAttempts.into());
+               return Err(TooManyKeyAttempts);
             }
             let key_hex = prompt_user("Enter the pairing key: ")
                .await
@@ -433,7 +429,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
 
       KeyOnly => {
          channel_tx.write_all(AuthCommands::REJECT).await?;
-         return Err(PairingNotAllowed.into());
+         return Err(PairingNotAllowed);
       }
 
       Password(password) => {
@@ -444,7 +440,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
             .await?
             .unwrap_or_default();
          if read == 0 {
-            return Err(EmptyPassword.into());
+            return Err(EmptyPassword);
          }
 
          let client_password = client_password[..read].to_vec();
@@ -458,7 +454,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
          .map_err(PasswordVerificationFailure)?;
          if !accept {
             channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(PasswordRejected.into());
+            return Err(PasswordRejected);
          }
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
       }
@@ -474,7 +470,7 @@ async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> 
          channel_rx.read_exact(&mut response_key).await?;
          if random_key != response_key {
             channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(KeyMismatch.into());
+            return Err(KeyMismatch);
          }
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
       }
@@ -606,7 +602,7 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
       Err(_) => {
          let err = HandshakeTimeout;
          connection.close(AuthenticationFailure.into(), err.to_string().as_bytes());
-         return Err(err.into());
+         return Err(err);
       }
    };
    if handshake_packet.starts_with(AuthCommands::INIT) {
@@ -617,6 +613,6 @@ pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result
       Ok(connection)
    } else {
       let err = InvalidAuthData;
-      Err(err.into())
+      Err(err)
    }
 }

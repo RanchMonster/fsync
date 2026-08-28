@@ -27,8 +27,8 @@ pub enum CloseCode {
    AuthenticationFailure = 5,
    // add more as needed
 }
-impl Into<VarInt> for CloseCode {
-   fn into(self) -> VarInt {
-      VarInt::from_u32(self as u32)
+impl From<CloseCode> for VarInt {
+   fn from(val: CloseCode) -> Self {
+      VarInt::from_u32(val as u32)
    }
 }

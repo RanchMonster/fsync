@@ -30,7 +30,7 @@ async fn test_find_ignores() {
 #[tokio::test]
 async fn test_ignore_rules() {
    let search_dir = test_dir("fsync_test_ignore_rules");
-   fs::write(&search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
+   fs::write(search_dir.join(".gitignore"), "/test.txt\n/test_dir").unwrap();
    let mut ignores = IgnoreMap::new();
    ignores.load(search_dir.clone()).await.unwrap();
    assert!(
@@ -58,7 +58,7 @@ async fn test_sync_logic() {
       .subscribe(search_dir.clone())
       .await
       .expect("Failed to subscribe to watcher");
-   fs::write(&search_dir.join("test.txt"), "Hello World").unwrap();
+   fs::write(search_dir.join("test.txt"), "Hello World").unwrap();
    if let Ok(events) = sub.recv().await {
       assert!(
          events
@@ -67,7 +67,7 @@ async fn test_sync_logic() {
          "test.txt should be created\n{events:?}"
       );
    }
-   fs::write(&search_dir.join("test.txt"), "Hello World2").unwrap();
+   fs::write(search_dir.join("test.txt"), "Hello World2").unwrap();
    if let Ok(events) = sub.recv().await {
       assert!(
          events
@@ -76,7 +76,7 @@ async fn test_sync_logic() {
          "test.txt should be modified\n{events:?}"
       );
    }
-   fs::rename(&search_dir.join("test.txt"), &search_dir.join("test2.txt")).unwrap();
+   fs::rename(search_dir.join("test.txt"), search_dir.join("test2.txt")).unwrap();
    if let Ok(events) = sub.recv().await {
       assert!(
          events
@@ -84,7 +84,7 @@ async fn test_sync_logic() {
             .any(|event| event.paths.contains(&search_dir.join("test2.txt")))
       );
    }
-   fs::copy(&search_dir.join("test2.txt"), &search_dir.join("test3.txt")).unwrap();
+   fs::copy(search_dir.join("test2.txt"), search_dir.join("test3.txt")).unwrap();
    if let Ok(events) = sub.recv().await {
       assert!(
          events
@@ -92,7 +92,7 @@ async fn test_sync_logic() {
             .any(|event| event.paths.contains(&search_dir.join("test3.txt"))),
       );
    }
-   fs::remove_file(&search_dir.join("test3.txt")).unwrap();
+   fs::remove_file(search_dir.join("test3.txt")).unwrap();
    if let Ok(events) = sub.recv().await {
       assert!(
          events
