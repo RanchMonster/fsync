@@ -1,11 +1,7 @@
-use fsync::CONFIG_DIR;
 use fsync::protocol::p2p_auth::{
-   AuthCommands, PairMode, PeerId, configure_client, configure_server, handle_incoming,
-   is_known_peer, pair_peer,
+   AuthCommands, PairMode, configure_client, configure_server, handle_incoming, pair_peer,
 };
 use quinn::{Connecting, Incoming};
-use rand::random;
-use std::str::FromStr;
 use tokio::task::JoinSet;
 
 const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
