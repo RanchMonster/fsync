@@ -113,33 +113,3 @@ async fn start_service(config_args: ServiceConfigArgs) -> ! {
       }
    }
 }
-
-async fn advertise_local_client(socket_adrr: SocketAddr, hostname: String) -> ServiceDaemon {
-   assert!(!hostname.is_empty(), "Hostname cannot be empty");
-   assert!(
-      hostname.len() <= 15,
-      "Hostname cannot be longer than 15 characters"
-   );
-
-   task::spawn_blocking(move || {
-      let service_daemon = ServiceDaemon::new().expect("Failed to create mdns daemon");
-      // load the address from the environment variable or default to auto assigned
-      let address = socket_adrr.ip().to_string();
-      let port = socket_adrr.port();
-      let service_info = ServiceInfo::new(
-         SERVICE_TYPE,
-         &hostname,
-         format!("{hostname}.local.").as_str(),
-         address,
-         port,
-         [(VERSION_KEY_PROPERTY, VERSION_NUMBER)].as_ref(),
-      )?
-      .enable_addr_auto();
-      service_daemon.register(service_info)?;
-
-      Ok::<_, Box<dyn std::error::Error + Send + Sync>>(service_daemon)
-   })
-   .await
-   .expect("Thread unexpectedly panicked")
-   .expect("Failed to create mdns service daemon")
-}
