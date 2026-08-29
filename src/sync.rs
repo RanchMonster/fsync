@@ -36,5 +36,5 @@ pub struct Event {
 
 #[async_trait]
 pub trait EventStream<E: SyncError> {
-   async fn next(&mut self) -> Result<Option<Event>, E>;
+   async fn next(&mut self) -> Option<Result<Event, E>>;
 }
