@@ -3,6 +3,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
+pub trait SyncError: std::error::Error + Send + Sync {}
 
 // This represents a change in a sync tree
 pub enum Change {
@@ -26,7 +27,6 @@ pub enum Change {
    },
    // Add more as needed
 }
-trait SyncError: std::error::Error + Send + Sync {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
