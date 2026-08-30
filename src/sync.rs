@@ -3,7 +3,16 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use blake3::Hash;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 pub trait SyncError: std::error::Error + Send + Sync {}
+
+#[derive(Error, Debug)]
+pub enum FileStreamError {
+   #[error("Error reading ignore file")]
+   IgnoreFileBuildError(#[from] ignore::Error),
+}
+
+impl SyncError for FileStreamError {}
 
 // This represents a change in a sync tree
 pub enum Change {
