@@ -80,3 +80,22 @@ fn get_ingnore_file(synced_location: PathBuf, allow_gitignore: bool) -> Option<I
             .and_then(build_ignore)
       })
 }
+
+/// Returns true if the given path should be ignored
+/// Requires the path to be under the ignore file
+pub fn should_ignore(path: &Path, ignore_file: &IgnoreFile) -> bool {
+   debug_assert!(path.exists(), "Path must exist");
+
+   let parent = ignore_file.path();
+   debug_assert!(
+      path.starts_with(parent),
+      "Path must be under the ignore file"
+   );
+
+   assert!(path.is_absolute(), "Path must be absolute");
+
+   let is_dir = path.is_dir();
+   ignore_file
+      .matched_path_or_any_parents(path, is_dir)
+      .is_ignore()
+}
