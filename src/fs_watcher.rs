@@ -30,21 +30,6 @@ macro_rules! deref_impl {
    };
 }
 
-/// Just a list of all the default ignore files supported by fsync
-const DEFAULT_IGNORE_FILES: &[&str] = &[".gitignore", ".ignore", ".fsyncignore"];
-
-/// Time to wait before alerting the tree to the changes.
-///
-/// Overridable with the `FSYNC_FILE_EVENT_DELAY` environment variable (in
-/// milliseconds), which tests use to avoid waiting in a controlled
-/// environment.
-fn file_event_delay() -> Duration {
-   std::env::var("FSYNC_FILE_EVENT_DELAY")
-      .ok()
-      .and_then(|value| value.parse().ok())
-      .map(Duration::from_millis)
-      .unwrap_or(Duration::from_secs(5))
-}
 /// Error type for the local sync handler
 #[derive(Error, Debug)]
 pub enum LocalSyncError {
@@ -65,75 +50,6 @@ pub enum LocalSyncError {
 
 /// Result type for the local sync handler
 type Result<T> = std::result::Result<T, LocalSyncError>;
-
-// Helper functions for local sync handling
-
-fn find_helper(path: PathBuf, tx: mpsc::Sender<Gitignore>) {
-   use std::fs::read_dir;
-
-   let mut builder = None;
-   let Ok(files) = read_dir(path.clone()) else {
-      tracing::error!(path=%path.display(), "Failed to read directory");
-      return;
-   };
-
-   for entry in files {
-      let Ok(entry) = entry else {
-         tracing::error!(path=%path.display(), "Failed to read entry in directory");
-         continue;
-      };
-
-      let is_dir = {
-         let Ok(ftype) = entry.file_type() else {
-            tracing::error!(path=%path.display(), "Failed to get file type");
-            continue;
-         };
-         ftype.is_dir()
-      };
-
-      if is_dir {
-         let tx = tx.clone();
-         task::spawn_blocking(move || find_helper(entry.path(), tx));
-         continue;
-      }
-
-      if let Some(name) = entry.file_name().to_str().map(|name| name.to_string()) {
-         let is_ignore_file = DEFAULT_IGNORE_FILES.contains(&name.as_str());
-         if is_ignore_file {
-            if builder.is_none() {
-               builder = Some(GitignoreBuilder::new(path.clone()));
-            }
-            builder.as_mut().unwrap().add(path.join(name));
-         }
-      }
-   }
-
-   if let Some(builder) = builder {
-      let Ok(built) = builder.build() else {
-         tracing::error!(path=%path.display(), "Failed to build gitignore");
-         return;
-      };
-      assert!(tx.blocking_send(built).is_ok(), "Failed to send gitignore");
-   }
-}
-
-#[instrument]
-pub async fn find_ignores(path: PathBuf) -> Result<Vec<Gitignore>> {
-   debug_assert!(path.is_dir(), "All sync trees must start from a directory");
-
-   let (tx, mut rx) = mpsc::channel(100);
-   task::spawn_blocking(move || find_helper(path, tx))
-      .await
-      .expect("Paniced while loading ignore files");
-
-   let mut ignore_files = Vec::new();
-   while let Some(ignore) = rx.recv().await {
-      ignore_files.push(ignore);
-   }
-
-   Ok(ignore_files)
-}
-
 pub struct WatcherReceiver {
    path: PathBuf,
    rx: broadcast::Receiver<Arc<Event>>,
@@ -166,9 +82,9 @@ pub struct IgnoreMap {
 }
 
 impl Default for IgnoreMap {
-    fn default() -> Self {
-        Self::new()
-    }
+   fn default() -> Self {
+      Self::new()
+   }
 }
 
 impl IgnoreMap {
