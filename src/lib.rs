@@ -1,6 +1,6 @@
-pub mod config;
-pub mod fs_watcher;
-pub mod protocol;
+mod config;
+mod fs_watcher;
+mod protocol;
 pub use crate::config::Config;
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 
