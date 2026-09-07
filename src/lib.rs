@@ -1,12 +1,8 @@
+pub mod config;
 pub mod fs_watcher;
 pub mod protocol;
-
-use blake3::Hash;
-use std::{
-   fs::create_dir_all,
-   path::{Path, PathBuf},
-   sync::LazyLock,
-};
+pub use crate::config::Config;
+use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 
 /// The directory where the configuration files are stored.
 /// Also handles creating the directory if it doesn't exist.
@@ -27,6 +23,20 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
    path
 });
 
-pub async fn hash_file(_path: &Path) -> Result<Hash, std::io::Error> {
-   todo!("hash the file")
+pub fn start_fsync() -> ! {
+   // Leak the config so it lives as long as the process does
+   let config = Box::leak(Box::new(Config::load().expect("Failed to load config")));
+
+   let worker_count = config.workers.get();
+   tracing::info!("Using {worker_count} worker threads");
+
+   let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .max_blocking_threads(worker_count)
+      .thread_name("fsync-worker")
+      .build()
+      .expect("Failed to build tokio runtime");
+   rt.block_on(protocol::start_service(config));
+
+   unreachable!("Service should not return");
 }

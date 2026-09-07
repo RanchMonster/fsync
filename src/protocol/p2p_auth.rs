@@ -194,7 +194,8 @@ pub async fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
 /// `PAIR` request from an unknown peer. The `Display` form of the mode is what
 /// is announced to the pairing client over the wire. The default is
 /// [`PairMode::Relaxed`].
-#[derive(Default)]
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PairMode {
    /// Strict mode: a random key is generated and announced, and the other
    /// device must enter it to complete the pairing.
