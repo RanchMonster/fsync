@@ -26,8 +26,8 @@ pub enum Change {
    },
    // Add more as needed
 }
-trait SyncError: std::error::Error + Send + Sync {}
-
+pub trait SyncError: std::error::Error + Send + Sync {}
+impl<T> SyncError for T where T: std::error::Error + Send + Sync {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
    tree: String,
@@ -38,3 +38,4 @@ pub struct Event {
 pub trait EventStream<E: SyncError> {
    async fn next(&mut self) -> Option<Result<Event, E>>;
 }
+struct FusedStreams {}
