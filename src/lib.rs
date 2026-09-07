@@ -3,6 +3,7 @@ pub mod fs_watcher;
 pub mod p2p;
 pub use crate::config::Config;
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
+mod sync;
 
 /// The directory where the configuration files are stored.
 /// Also handles creating the directory if it doesn't exist.
