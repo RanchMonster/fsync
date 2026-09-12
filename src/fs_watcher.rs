@@ -166,9 +166,9 @@ pub struct IgnoreMap {
 }
 
 impl Default for IgnoreMap {
-    fn default() -> Self {
-        Self::new()
-    }
+   fn default() -> Self {
+      Self::new()
+   }
 }
 
 impl IgnoreMap {
