@@ -2,8 +2,12 @@ mod config;
 pub mod fs_watcher;
 pub mod p2p;
 pub use crate::config::Config;
+
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 mod sync;
+
+#[cfg(test)]
+use std::fs::remove_dir_all;
 
 /// The directory where the configuration files are stored.
 /// Also handles creating the directory if it doesn't exist.
@@ -20,9 +24,10 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
                .expect("Failed to find home directory")
                .join(".fsync")
          });
-      if !path.exists() {
-         create_dir_all(&path).expect("Failed to create config dir.");
+      if path.exists() {
+         remove_dir_all(&path).expect("Failed to remove old config dir.");
       }
+      create_dir_all(&path).expect("Failed to create config dir.");
       return path;
    }
    #[cfg(not(test))]
@@ -47,9 +52,11 @@ pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
                .expect("Failed to find home directory")
                .join(".fsync")
          });
-      if !path.exists() {
-         create_dir_all(&path).expect("Failed to create data dir.");
+      if path.exists() {
+         remove_dir_all(&path).expect("Failed to remove old data dir.");
       }
+
+      create_dir_all(&path).expect("Failed to create data dir.");
       return path;
    }
    #[cfg(not(test))]
