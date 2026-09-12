@@ -1,5 +1,5 @@
 use fsync::CONFIG_DIR;
-use fsync::protocol::p2p_auth::mtls::{cache_path, generate_self_signed_cert};
+use fsync::p2p::auth::mtls::{cache_path, generate_self_signed_cert};
 use rustls::pki_types::PrivateKeyDer;
 use std::fs;
 

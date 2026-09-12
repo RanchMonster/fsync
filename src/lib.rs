@@ -1,6 +1,6 @@
 mod config;
 mod fs_watcher;
-mod p2p;
+pub mod p2p;
 pub use crate::config::Config;
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 

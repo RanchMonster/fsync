@@ -1,8 +1,8 @@
+pub mod auth;
 mod discovery;
 mod error;
-pub mod p2p_auth;
+use auth::{AuthError, configure_client, configure_server, get_peer_id, handle_incoming};
 use discovery::{advertise_local_client, handle_event};
-use p2p_auth::{AuthError, configure_client, configure_server, get_peer_id, handle_incoming};
 use quinn::Endpoint;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio::task::{self};
 
 use crate::Config;
-pub use crate::p2p::p2p_auth::PairMode;
+pub use crate::p2p::auth::PairMode;
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const VERSION_KEY_PROPERTY: &str = "version";

@@ -1,7 +1,7 @@
+use crate::p2p::auth::{AuthError, PeerId};
 use crate::p2p::discovery::EventError::{InvalidFullname, NoValidConnectionPath};
-use crate::p2p::p2p_auth::{AuthError, PeerId};
 
-use super::p2p_auth::{authenticate_client_side, is_known_peer};
+use super::auth::{authenticate_client_side, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
 use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
@@ -235,7 +235,7 @@ mod tests {
    use super::*;
    use crate::{
       CONFIG_DIR,
-      p2p::p2p_auth::{
+      p2p::auth::{
          KNOWN_PEERS_LOCK, PairMode, configure_client, configure_server, get_peer_id,
          handle_incoming,
       },

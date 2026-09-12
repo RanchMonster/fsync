@@ -1,4 +1,4 @@
-use fsync::protocol::p2p_auth::{
+use fsync::p2p::auth::{
    AuthCommands, PairMode, configure_client, configure_server, handle_incoming, pair_peer,
 };
 use quinn::{Connecting, Incoming};
