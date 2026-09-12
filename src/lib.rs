@@ -10,17 +10,57 @@ use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 /// The location can be overridden with the `FSYNC_CONFIG_DIR` environment
 /// variable, which tests use to avoid touching the real config directory.
 pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-   let path = std::env::var_os("FSYNC_CONFIG_DIR")
-      .map(PathBuf::from)
-      .unwrap_or_else(|| {
-         dirs::home_dir()
-            .expect("Failed to find home directory")
-            .join(".fsync")
-      });
-   if !path.exists() {
-      create_dir_all(&path).expect("Failed to create config dir.");
+   #[cfg(test)]
+   {
+      let path = std::env::var_os("FSYNC_CONFIG_DIR")
+         .map(PathBuf::from)
+         .unwrap_or_else(|| {
+            dirs::home_dir()
+               .expect("Failed to find home directory")
+               .join(".fsync")
+         });
+      if !path.exists() {
+         create_dir_all(&path).expect("Failed to create config dir.");
+      }
+      return path;
    }
-   path
+   #[cfg(not(test))]
+   {
+      let path = dirs::config_local_dir()
+         .expect("Failed to find config directory")
+         .join("fsync");
+      if !path.exists() {
+         create_dir_all(&path).expect("Failed to create config dir.");
+      }
+      return path;
+   }
+});
+
+pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+   #[cfg(test)]
+   {
+      let path = std::env::var_os("FSYNC_DATA_DIR")
+         .map(PathBuf::from)
+         .unwrap_or_else(|| {
+            dirs::home_dir()
+               .expect("Failed to find home directory")
+               .join(".fsync")
+         });
+      if !path.exists() {
+         create_dir_all(&path).expect("Failed to create data dir.");
+      }
+      return path;
+   }
+   #[cfg(not(test))]
+   {
+      let path = dirs::data_local_dir()
+         .expect("Failed to find data directory")
+         .join("fsync");
+      if !path.exists() {
+         create_dir_all(&path).expect("Failed to create data dir.");
+      }
+      return path;
+   }
 });
 
 pub fn start_fsync() -> ! {
