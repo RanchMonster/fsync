@@ -7,6 +7,7 @@ use blake3::Hash;
 use serde::{Deserialize, Serialize};
 
 // This represents a change in a sync tree
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Change {
    Create {
       path: String,
@@ -37,6 +38,7 @@ impl<T> SyncError for T where T: std::error::Error + Send + Sync {}
 pub struct Event {
    tree: String,
    timestamp: SystemTime,
+   changes: Vec<Change>,
 }
 
 #[async_trait]
