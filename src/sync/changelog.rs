@@ -10,7 +10,7 @@ use crate::DATA_DIR;
 use parking_lot::RwLock;
 use std::{
    fs::{self, File},
-   io::{BufRead, BufReader, BufWriter, Write},
+   io::{BufRead, BufReader, BufWriter, ErrorKind, Write},
    path::PathBuf,
    sync::LazyLock,
    time::{Duration, SystemTime},
@@ -61,6 +61,7 @@ pub fn read_changes_since(since: SystemTime) -> Result<Vec<Event>> {
 }
 
 pub fn clear_changelog(since: Option<SystemTime>) -> Result<()> {
+   use ErrorKind::CrossesDevices;
    let _guard = CHANGELOG_LOCK.write();
 
    if !CHANGELOG_PATH.exists() {
@@ -86,6 +87,37 @@ pub fn clear_changelog(since: Option<SystemTime>) -> Result<()> {
    }
 
    temp_file_writer.flush()?;
-   fs::rename(&temp_file_path, &*CHANGELOG_PATH)?;
+   let Err(error) = fs::rename(&temp_file_path, &*CHANGELOG_PATH) else {
+      return Ok(());
+   };
+   if error.kind() == CrossesDevices {
+      fs::copy(&temp_file_path, &*CHANGELOG_PATH)?;
+      fs::remove_file(&temp_file_path)?;
+   };
    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use crate::sync::Change;
+   #[test]
+   fn test_changelog() {
+      let event = Event {
+         tree: "test".to_string(),
+         timestamp: SystemTime::now(),
+         changes: vec![Change::Create {
+            path: "test".to_string(),
+            is_dir: true,
+         }],
+      };
+      append_event(event.clone()).unwrap();
+      let events = read_changes_since(SystemTime::now() - MAX_TIME_STORED).unwrap();
+      assert_eq!(events.len(), 1);
+      assert_eq!(events[0].tree, event.tree);
+      assert_eq!(events[0].changes.len(), 1);
+      clear_changelog(Some(SystemTime::now())).unwrap();
+      let events = read_changes_since(SystemTime::now() - MAX_TIME_STORED).unwrap();
+      assert_eq!(events.len(), 0);
+   }
 }
