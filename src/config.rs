@@ -12,7 +12,7 @@ use thiserror::Error;
 use tracing::instrument;
 
 use crate::CONFIG_DIR;
-use crate::protocol::PairMode;
+use crate::p2p::PairMode;
 
 const FILE_START_POSITION: u64 = 0;
 

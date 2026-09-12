@@ -1,6 +1,6 @@
 mod config;
 mod fs_watcher;
-mod protocol;
+mod p2p;
 pub use crate::config::Config;
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 
@@ -36,7 +36,7 @@ pub fn start_fsync() -> ! {
       .thread_name("fsync-worker")
       .build()
       .expect("Failed to build tokio runtime");
-   rt.block_on(protocol::start_service(config));
+   rt.block_on(p2p::start_service(config));
 
    unreachable!("Service should not return");
 }

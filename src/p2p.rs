@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use tokio::task::{self};
 
 use crate::Config;
-pub use crate::protocol::p2p_auth::PairMode;
+pub use crate::p2p::p2p_auth::PairMode;
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const VERSION_KEY_PROPERTY: &str = "version";

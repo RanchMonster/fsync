@@ -35,7 +35,7 @@ use tracing::instrument;
 use x509_parser::nom::AsBytes;
 
 use super::error::CloseCode;
-use crate::{CONFIG_DIR, protocol::error::QuicError};
+use crate::{CONFIG_DIR, p2p::error::QuicError};
 
 #[cfg(test)]
 pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
