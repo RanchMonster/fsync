@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 
 // This represents a change in a sync tree
 pub enum Change {
-   CreateFile(String),
+   Create {
+      path: String,
+      is_dir: bool,
+   },
 
-   CreateDir(String),
-
-   Delete(String),
+   Delete {
+      path: String,
+   },
 
    Modify {
       target: String,
