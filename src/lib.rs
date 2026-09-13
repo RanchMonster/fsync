@@ -8,6 +8,24 @@ use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 #[cfg(test)]
 use std::fs::remove_dir_all;
 
+/// The asyncfiy macro is a convenience macro for wrapping a sync function in a tokio blocing task
+/// This is useful for testing and for making the code more readable
+#[macro_export]
+macro_rules! asyncify {
+
+   ($func:expr) => {{
+      tokio::task::spawn_blocking(move || $func)
+         .await
+         .expect("Thread panicked unexpectedly")
+   }};
+
+   ($func:expr, $($arg:expr),*) => {{
+      tokio::task::spawn_blocking(move || $func($($arg),*))
+         .await
+         .expect("Thread panicked unexpectedly")
+   }};
+}
+
 /// The directory where the configuration files are stored.
 /// Also handles creating the directory if it doesn't exist.
 ///
