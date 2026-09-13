@@ -1,6 +1,4 @@
-use fsync::p2p::auth::{
-   AuthCommands, PairMode, configure_client, configure_server, handle_incoming, pair_peer,
-};
+use fsync::p2p::auth::{AuthCommands, configure_client, configure_server, handle_incoming};
 use quinn::{Connecting, Incoming};
 use tokio::task::JoinSet;
 
@@ -17,18 +15,11 @@ fn setup_config_dir() {
 }
 
 async fn connecting_peer(connect_attempt: Connecting) {
-   let mut connection = connect_attempt.await.expect("failed to connect");
-   // send pairing request
-   connection
-      .send_datagram(AuthCommands::PAIR.into())
-      .expect("failed to send pairing request");
-   pair_peer(&mut connection, None)
-      .await
-      .expect("failed to pair peer");
+   todo!("Implement connecting_peer");
 }
 
-async fn responding_peer(incoming: Incoming, pair_mode: PairMode) {
-   handle_incoming(incoming, &pair_mode)
+async fn responding_peer(incoming: Incoming) {
+   handle_incoming(incoming)
       .await
       .expect("failed to handle incoming connection");
 }
@@ -61,7 +52,6 @@ async fn test_pair_peer_relaxed() {
    task_set.spawn(connecting_peer(connection));
    task_set.spawn(responding_peer(
       server.accept().await.expect("failed to accept connection"),
-      PairMode::Relaxed,
    ));
    task_set.join_all().await;
 }

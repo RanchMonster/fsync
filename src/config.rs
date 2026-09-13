@@ -12,7 +12,6 @@ use thiserror::Error;
 use tracing::instrument;
 
 use crate::CONFIG_DIR;
-use crate::p2p::PairMode;
 
 const FILE_START_POSITION: u64 = 0;
 
@@ -55,10 +54,6 @@ const fn default_port() -> u16 {
    43127
 }
 
-fn default_pair_mode() -> String {
-   "RELAXED".to_string()
-}
-
 fn default_address() -> String {
    "0.0.0.0".to_string()
 }
@@ -87,8 +82,6 @@ struct ConfigIntermediater {
    #[serde(default = "default_address")]
    address: String,
 
-   #[serde(default = "default_pair_mode")]
-   pair_mode: String,
 
    #[serde(default = "default_hostname")]
    hostname: String,
@@ -103,7 +96,6 @@ struct ConfigIntermediater {
 pub struct Config {
    pub port: u16,
    pub address: String,
-   pub pair_mode: PairMode,
    pub hostname: String,
    pub sync_dirs: HashMap<String, PathBuf>,
    pub workers: NonZeroUsize,
@@ -161,15 +153,12 @@ impl Config {
          hostname,
          workers,
          sync_dirs,
-         pair_mode,
       } = toml::from_str(&config_contents).map_err(Toml)?;
 
-      let pair_mode = convert_to_pair_mode(&pair_mode, config_dir)?;
 
       Ok(Config {
          port,
          address,
-         pair_mode,
          hostname,
          workers,
          sync_dirs,
@@ -222,53 +211,6 @@ impl Config {
    }
 }
 
-// --- utility functions ---
-
-fn load_password_hash(password_hash_file: &mut File) -> Result<PasswordHashString> {
-   use ConfigError::{FailedToReadPasswordHash, PasswordIsCorrupted};
-   // This operation is a slow syscall, also really this like won't ever happen unless we make it
-   // happen in the first place
-   debug_assert_eq!(
-      password_hash_file
-         .stream_position()
-         .expect("Failed to get password hash file position"),
-      FILE_START_POSITION
-   );
-
-   let mut password_buffer = String::new();
-   password_hash_file
-      .read_to_string(&mut password_buffer)
-      .map_err(FailedToReadPasswordHash)?;
-   // So I wanted to pass the error up the stack but apparently argon2 doesn't implement error correctly or something so we aren't going to log it we can change it later if needed
-   PasswordHashString::from_str(password_buffer.trim()).map_err(|_| PasswordIsCorrupted)
-}
-
-fn convert_to_pair_mode(pair_mode: &str, config_dir: &Path) -> Result<PairMode, ConfigError> {
-   use ConfigError::FailedToReadPasswordHash;
-
-   assert!(!pair_mode.is_empty(), "Pair mode shouldn't be empty");
-   assert!(
-      pair_mode.is_ascii(),
-      "Pair mode should be ascii characters only"
-   );
-
-   use ConfigError::UnknownPairMode;
-   use PairMode::*;
-   match pair_mode {
-      "STRICT" => Ok(Strict),
-      "RELAXED" => Ok(Relaxed),
-      "PASSWORD" => {
-         let mut password_hash_file =
-            File::open(config_dir.join("password.hash")).map_err(FailedToReadPasswordHash)?;
-
-         let loaded_password = load_password_hash(&mut password_hash_file)?;
-         Ok(Password(Arc::new(loaded_password)))
-      }
-      "KEYONLY" => Ok(KeyOnly),
-      other => Err(UnknownPairMode(other.to_string())),
-   }
-}
-
 #[cfg(test)]
 mod tests {
    use super::*;
@@ -285,7 +227,6 @@ mod tests {
       let config = Config::create_default_config().expect("Failed to create default config");
       assert_eq!(config.port, 43127);
       assert_eq!(config.address, "0.0.0.0");
-      assert_eq!(config.pair_mode, PairMode::Relaxed);
       assert_eq!(config.hostname, "fsync");
    }
 }
