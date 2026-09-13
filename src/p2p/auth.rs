@@ -35,7 +35,13 @@ use tracing::instrument;
 use x509_parser::nom::AsBytes;
 
 use super::error::CloseCode;
-use crate::{CONFIG_DIR, p2p::error::QuicError};
+use crate::{
+   DATA_DIR, asyncify,
+   p2p::{
+      auth::pairing_key::{PairingKey, load_pairing_key},
+      error::QuicError,
+   },
+};
 
 #[cfg(test)]
 pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -121,76 +127,63 @@ impl Display for PeerId {
 }
 
 /// Checks whether the given key hash is present in the known peers list
-/// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
+/// stored in `DATA_DIR/known_peers`. A missing file is treated as an empty
 /// list, so this returns `false` rather than panicking.
 ///
 /// # Panics
 ///
 /// Panics if the file exists but cannot be opened, or if more than ten
 /// lines are empty, unparseable, or unreadable.
-pub async fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
+pub fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
    use AuthError::KnownPeersCheckFailed;
-   fn sync_check_logic(connecting_peer_id: PeerId) -> Result<bool> {
-      use ErrorKind::NotFound;
-      let path = CONFIG_DIR.join("known_peers");
-      let file = match File::open(&path) {
-         Ok(file) => file,
-         Err(err) => {
-            if err.kind() == NotFound {
-               tracing::warn!(
-                  known_peers_file =% path.display(),
-                  error =% err,
-                  "Know peers file doesn't exist"
-               );
-               return Ok(false);
-            }
-            return Err(KnownPeersCheckFailed(err));
+   use ErrorKind::NotFound;
+   let path = DATA_DIR.join("known_peers");
+   let file = match File::open(&path) {
+      Ok(file) => file,
+      Err(err) => {
+         if err.kind() == NotFound {
+            tracing::warn!(
+               known_peers_file =% path.display(),
+               error =% err,
+               "Know peers file doesn't exist"
+            );
+            return Ok(false);
          }
-      };
-      let known_peers_file = BufReader::new(file);
-      for line in known_peers_file.lines() {
-         let line = line.map_err(KnownPeersCheckFailed)?;
-
-         // I decide to simplify this to just print a warning and move on for now.
-         // I decided to do something else here I want to allow the program to keep running but also
-         // don't allow the corrupted file to continue to exist.
-         let Ok(stored_peer_id) = PeerId::from_str(&line) else {
-            #[cfg(debug_assertions)]
-            {
-               tracing::warn!(bad_line=%line,known_peers_file_path=%path.display(),"The known peers file is corupted");
-               continue;
-            }
-            #[cfg(not(debug_assertions))]
-            todo!("Find a better way to handle invalid file state");
-         };
-         if stored_peer_id == connecting_peer_id {
-            return Ok(true);
-         }
+         return Err(KnownPeersCheckFailed(err));
       }
-      Ok(false)
-   }
+   };
+   let known_peers_file = BufReader::new(file);
 
-   let peer_id = *peer_id;
-   task::spawn_blocking(move || sync_check_logic(peer_id))
-      .await
-      .expect("Thread paniced unexpectedly while attempting to check known peer file")
-}
+   for line in known_peers_file.lines() {
+      let line = line.map_err(KnownPeersCheckFailed)?;
 
+      let stored_peer_id = PeerId::from_str(&line).expect(
+         "known peers file is corrupted please remove or reslove the issue and restart the program",
+      );
+
+      if stored_peer_id == *peer_id {
+         return Ok(true);
       }
    }
+
+   Ok(false)
 }
 
 /// Records the given peer in the known peers list, appending it if it is not
 /// already present.
-async fn add_known_peer(peer: PeerId) -> Result<()> {
+fn add_known_peer(peer: PeerId) -> Result<()> {
    use AuthError::KnownPeersCheckFailed;
+   if is_known_peer(&peer)? {
+      return Ok(());
+   }
 
-   fn sync_inner(peer: PeerId) -> Result<(), std::io::Error> {
+   let result = (|| {
       let mut file = File::options()
          .read(true)
          .append(true)
          .create(true)
-         .open(CONFIG_DIR.join("known_peers"))?;
+         .open(DATA_DIR.join("known_peers"))?;
+
       if file.metadata()?.len() > 0 {
          file.seek(SeekFrom::End(-1))?;
          let mut last_char = [0];
@@ -199,17 +192,13 @@ async fn add_known_peer(peer: PeerId) -> Result<()> {
             file.write_all(b"\n")?;
          }
       }
+
       writeln!(file, "{}", peer)?;
       Ok(())
-   }
+   })()
+   .map_err(KnownPeersCheckFailed);
 
-   if is_known_peer(&peer).await? {
-      return Ok(());
-   }
-   task::spawn_blocking(move || sync_inner(peer))
-      .await
-      .expect("Thread unexpectedly panicked")
-      .map_err(KnownPeersCheckFailed)
+   result
 }
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
@@ -247,7 +236,7 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    use AuthError::UnknownPeer;
    let peer_id = peer_key_hash(connection)?;
-   if !is_known_peer(&peer_id).await? {
+   if asyncify!(is_known_peer, &peer_id)? {
       return Err(UnknownPeer);
    }
    Ok(())
