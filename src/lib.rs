@@ -87,6 +87,33 @@ pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       path
    }
 });
+pub static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+   #[cfg(test)]
+   {
+      let path = std::env::var_os("FSYNC_CACHE_DIR")
+         .map(PathBuf::from)
+         .unwrap_or_else(|| {
+            dirs::home_dir()
+               .expect("Failed to find home directory")
+               .join(".fsync")
+         });
+      if path.exists() {
+         remove_dir_all(&path).expect("Failed to remove old cache dir.");
+      }
+      create_dir_all(&path).expect("Failed to create cache dir.");
+      return path;
+   }
+   #[cfg(not(test))]
+   {
+      let path = dirs::cache_dir()
+         .expect("Failed to find cache directory")
+         .join("fsync");
+      if !path.exists() {
+         create_dir_all(&path).expect("Failed to create cache dir.");
+      }
+      return path;
+   }
+});
 
 pub fn start_fsync() -> ! {
    // Leak the config so it lives as long as the process does
