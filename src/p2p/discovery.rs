@@ -2,10 +2,10 @@ use crate::asyncify;
 use crate::p2p::auth::{AuthError, PeerId};
 use crate::p2p::discovery::EventError::{InvalidFullname, NoValidConnectionPath};
 
-use super::auth::{authenticate_client_side, is_known_peer};
+use super::auth::{handle_connecting, is_known_peer};
 use super::{SERVICE_TYPE, VERSION_KEY_PROPERTY, VERSION_NUMBER};
 use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
-use quinn::{ConnectError, Connection, ConnectionError, Endpoint};
+use quinn::{ConnectError, Connecting, ConnectionError, Endpoint};
 use std::str::FromStr;
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use thiserror::Error;
@@ -88,7 +88,7 @@ type Result<T, E = EventError> = std::result::Result<T, E>;
 // should keep this function as the main entry point for that logic.
 async fn find_valid_connect_path<I>(
    endpoint: &Endpoint, addresses: I, hostname: &str, port: u16,
-) -> Result<Option<Connection>>
+) -> Result<Option<Connecting>>
 where
    I: IntoIterator<Item = ScopedIp>,
 {
@@ -107,9 +107,8 @@ where
    let addresses = addresses.into_iter().filter(is_valid).map(to_socket_addr);
    for addr in addresses {
       match endpoint.connect(addr, hostname) {
-         Ok(connection) => {
-            let connection = connection.await?;
-            return Ok(Some(connection));
+         Ok(connecting) => {
+            return Ok(Some(connecting));
          }
          Err(InvalidRemoteAddress(addr)) => {
             tracing::debug!("Invalid remote address {addr:?}");
@@ -172,15 +171,13 @@ pub async fn handle_event(
             }
          }
 
-         let mut connection = find_valid_connect_path(&endpoint, addresses, hostname, port)
+         let connection = find_valid_connect_path(&endpoint, addresses, hostname, port)
             .await?
             .ok_or(NoValidConnectionPath(fullname.to_string()))?;
 
-         authenticate_client_side(&mut connection)
-            .await
-            .inspect_err(|err| {
-               tracing::warn!("Authentication handshake failed: {err:?}");
-            });
+         handle_connecting(connection).await.inspect_err(|err| {
+            tracing::warn!("Authentication handshake failed: {err:?}");
+         });
 
          todo!("handle the connection");
       }
