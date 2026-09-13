@@ -1,3 +1,4 @@
+use crate::asyncify;
 use crate::p2p::auth::{AuthError, PeerId};
 use crate::p2p::discovery::EventError::{InvalidFullname, NoValidConnectionPath};
 
@@ -166,7 +167,7 @@ pub async fn handle_event(
                return Err(UnsupportedVersion);
             }
 
-            if !is_known_peer(&peer_id).await? {
+            if !asyncify!(is_known_peer, &peer_id)? {
                return Ok(());
             }
          }
