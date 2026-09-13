@@ -59,16 +59,6 @@ pub enum AuthError {
    KnownPeersCheckFailed(#[source] std::io::Error),
    #[error("peer is not a known peer")]
    UnknownPeer,
-   #[error("Received invalid pairing mode from peer")]
-   InvalidPairMode,
-   #[error("failed to verify password")]
-   PasswordVerificationFailure(#[source] JoinError),
-   #[error("Key only mode does not allow pairing")]
-   PairingNotAllowed,
-   #[error("Password must be at least 1 character long")]
-   EmptyPassword,
-   #[error("Password rejected")]
-   PasswordRejected,
    #[error("Key mismatch")]
    KeyMismatch,
    #[error("failed to register peer: {0}")]
@@ -79,10 +69,6 @@ pub enum AuthError {
    HandshakeTimeout,
    #[error("invalid auth handshake data")]
    InvalidAuthData,
-   #[error("Too many password attempts")]
-   TooManyPasswordAttempts,
-   #[error("Too many pairing key attempts")]
-   TooManyKeyAttempts,
    #[error("invalid pairing key: {0}")]
    InvalidPairingKey(#[source] hex::FromHexError),
    #[error(transparent)]
@@ -190,35 +176,6 @@ pub async fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
       .expect("Thread paniced unexpectedly while attempting to check known peer file")
 }
 
-/// Represents the pairing mode of this device: how the server side handles a
-/// `PAIR` request from an unknown peer. The `Display` form of the mode is what
-/// is announced to the pairing client over the wire. The default is
-/// [`PairMode::Relaxed`].
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum PairMode {
-   /// Strict mode: a random key is generated and announced, and the other
-   /// device must enter it to complete the pairing.
-   Strict,
-   /// Relaxed mode: other devices can connect without any confirmation from
-   /// this device.
-   #[default]
-   Relaxed,
-   /// Password mode: other devices can connect to this device by providing
-   /// the password whose hash is stored in this variant.
-   Password(Arc<PasswordHashString>),
-   /// Key only mode: pairing is not allowed; users must manually copy the
-   /// public key to both devices instead.
-   KeyOnly,
-   // Add other modes here as needed
-}
-impl Display for PairMode {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      match self {
-         PairMode::Strict => write!(f, "STRICT"),
-         PairMode::Relaxed => write!(f, "RELAXED"),
-         PairMode::Password(_) => write!(f, "PASSWORD"),
-         PairMode::KeyOnly => write!(f, "KEYONLY"),
       }
    }
 }
@@ -296,253 +253,6 @@ pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
    Ok(())
 }
 
-/// Prompts the user for input on stdin, returning the trimmed line.
-///
-/// # Errors
-///
-/// Returns [`std::io::Error`] if writing the prompt or reading the input fails.
-async fn prompt_user(prompt: &'static str) -> Result<String, std::io::Error> {
-   fn sync_inner(prompt: &str) -> Result<String, std::io::Error> {
-      use std::io::{stdin, stdout};
-      let mut stdout = stdout();
-      stdout.write_all(prompt.as_bytes())?;
-      stdout.flush()?;
-      let mut line = String::new();
-      stdin().read_line(&mut line)?;
-      Ok(line.trim().to_string())
-   }
-   task::spawn_blocking(|| sync_inner(prompt))
-      .await
-      .expect("Thread unexpectedly panicked")
-}
-
-/// Client side of the pairing exchange: reads the pair mode announced by the
-/// server and provides the requested credentials. The peer is recorded as
-/// known on the server side of the exchange, not here.
-///
-/// # Errors
-///
-/// Returns [`AuthError`] if the pairing key or password is rejected, the
-/// input is invalid, or the maximum number of attempts is exceeded, and
-/// [`QuicError`] if the pairing stream fails.
-///
-/// # Panics
-///
-/// Panics if the server announces an unknown pair mode, or if reading input
-/// from the user fails.
-async fn pair_client_side(connection: &mut Connection) -> Result<()> {
-   use AuthError::{
-      InvalidPairMode, InvalidPairingKey, TooManyKeyAttempts, TooManyPasswordAttempts,
-   };
-   assert_eq!(
-      AuthCommands::ACCEPT.len(),
-      AuthCommands::REJECT.len(),
-      "the pairing response must both be the same length"
-   );
-
-   async fn accepted(channel_rx: &mut RecvStream) -> Result<bool> {
-      let mut response_buf = [0u8; AuthCommands::ACCEPT.len()];
-      let Ok(result) = timeout(
-         Duration::from_secs(5),
-         channel_rx.read_exact(&mut response_buf),
-      )
-      .await
-      else {
-         tracing::warn!("Timed out waiting for pairing response");
-         return Ok(false);
-      };
-      result?;
-      Ok(response_buf == AuthCommands::ACCEPT)
-   }
-   /// Helper function to simplify the decoding of the pairing key
-   fn decoed_pairing_key(key: &str) -> Result<[u8; 8], FromHexError> {
-      let key_hex = hex::decode(key)?
-         .try_into()
-         .map_err(|_| FromHexError::InvalidStringLength)?;
-      Ok(key_hex)
-   }
-   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
-
-   let mut mode_len = [0; 1];
-   channel_rx.read_exact(&mut mode_len).await?;
-   let mut mode_buf = vec![0; mode_len[0] as usize];
-   channel_rx.read_exact(&mut mode_buf).await?;
-   let mode_str = std::str::from_utf8(&mode_buf).map_err(|_| InvalidPairMode)?;
-   match mode_str {
-      "RELAXED" => {}
-
-      "PASSWORD" => {
-         let mut password_attempts = 0;
-         loop {
-            if password_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyPasswordAttempts);
-            }
-            let password = prompt_user("Password: ")
-               .await
-               // I am still expecting this because there are only two reasons this _could_ fail
-               // 1. stdin is not readable
-               // 2. the read data is not valid utf8/utf16
-               .expect("Failed to read password input");
-            if password.is_empty() || password.len() > 256 {
-               // I am not using tracing here because that is for logging this is for user feedback
-               eprintln!("Password must be between 1 and 256 characters long");
-               password_attempts += 1;
-               continue;
-            }
-            channel_tx.write_all(password.as_bytes()).await?;
-            if accepted(&mut channel_rx).await? {
-               break;
-            }
-            password_attempts += 1;
-         }
-      }
-
-      "STRICT" => {
-         let mut key_attempts = 0;
-         loop {
-            if key_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyKeyAttempts);
-            }
-            let key_hex = prompt_user("Enter the pairing key: ")
-               .await
-               // Same as password prompt
-               .expect("Failed to read pairing key input")
-               .chars()
-               .filter(|c| *c != '-')
-               .collect::<String>();
-            let key = decoed_pairing_key(&key_hex).map_err(InvalidPairingKey)?;
-            channel_tx.write_all(&key).await?;
-            if accepted(&mut channel_rx).await? {
-               break;
-            }
-            key_attempts += 1;
-         }
-      }
-
-      "KEYONLY" => {}
-
-      _ => return Err(InvalidPairMode),
-   }
-
-   Ok(())
-}
-
-/// Server side of the pairing exchange: announces the configured pair mode,
-/// validates the client's response, and records the peer as known on success.
-///
-/// # Errors
-///
-/// Returns [`AuthError`] if the pairing is rejected, and [`QuicError`] for
-/// stream or connection failures.
-async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
-   use AuthError::{
-      EmptyPassword, KeyMismatch, PairingNotAllowed, PasswordRejected, PasswordVerificationFailure,
-   };
-   use PairMode::*;
-   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
-   let mode = pair_mode.to_string();
-   let mode_len = u8::try_from(mode.len()).expect("pair mode string is too long");
-   channel_tx.write_all(&[mode_len]).await?;
-   channel_tx.write_all(mode.as_bytes()).await?;
-   match pair_mode {
-      Relaxed => {
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      }
-
-      KeyOnly => {
-         channel_tx.write_all(AuthCommands::REJECT).await?;
-         return Err(PairingNotAllowed);
-      }
-
-      Password(password) => {
-         let password = password.clone();
-         let mut client_password = [0u8; 256]; // any password longer than this is rejected
-         let read = channel_rx
-            .read(&mut client_password)
-            .await?
-            .unwrap_or_default();
-         if read == 0 {
-            return Err(EmptyPassword);
-         }
-
-         let client_password = client_password[..read].to_vec();
-         let verifier = Argon2::default();
-         let accept = task::spawn_blocking(move || {
-            verifier
-               .verify_password(&client_password, &password.password_hash())
-               .is_ok()
-         })
-         .await
-         .map_err(PasswordVerificationFailure)?;
-         if !accept {
-            channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(PasswordRejected);
-         }
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      }
-      Strict => {
-         let random_key = random::<[u8; 8]>();
-         let as_hex_string = random_key.map(|byte| format!("{byte:02X}")).join("-");
-         tracing::info!("Generated random key for device: {as_hex_string}");
-         assert!(
-            as_hex_string.len() == 23,
-            "Generated key must be 23 characters long when encoded with dashes"
-         );
-         let mut response_key = [0; 8];
-         channel_rx.read_exact(&mut response_key).await?;
-         if random_key != response_key {
-            channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(KeyMismatch);
-         }
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      }
-   }
-   let peer_id = peer_key_hash(connection)?;
-   add_known_peer(peer_id).await?;
-   Ok(())
-}
-
-/// Runs the pairing handshake over an established QUIC connection.
-///
-/// The exchange is driven by the connection's role: the client side reads the
-/// pair mode announced by the server and supplies the requested credentials,
-/// while the server side announces its configured [`PairMode`] and validates
-/// the client's response. The server records the peer in the known peers list
-/// when the pairing succeeds.
-///
-/// # Arguments
-///
-/// * `connection` - the established QUIC connection to the peer.
-/// * `pair_mode` - the mode used on the server side of the exchange. It is
-///   required (this function panics if it is `None` on the server side) and
-///   is ignored on the client side.
-///
-/// # Errors
-///
-/// On the server side, returns [`AuthError`] when the pairing is rejected
-/// (for example `KeyOnly` mode, a password or key mismatch, or failing to
-/// record the peer) and [`QuicError`] for stream or connection failures.
-///
-/// On the client side the exchange's errors are not propagated; this function
-/// always returns `Ok`.
-///
-/// # Panics
-///
-/// Panics if the server side is used without a [`PairMode`].
-pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>) -> Result<()> {
-   use Side::{Client, Server};
-   match connection.side() {
-      Client => {
-         pair_client_side(connection).await;
-         Ok(())
-      }
-      Server => {
-         pair_server_side(
-            connection,
-            pair_mode.expect("server side pairing requires a pair mode"),
-         )
-         .await
-      }
    }
 }
 
@@ -573,19 +283,6 @@ pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()>
    }
 }
 
-/// Client side of the pairing handshake: announces a pairing request and runs
-/// the exchange with the server.
-///
-/// Sends a `PAIR` datagram, then delegates the rest of the exchange to
-/// [`pair_peer`].
-///
-/// # Errors
-///
-/// Returns [`QuicError`] if the `PAIR` datagram cannot be sent, or
-/// [`AuthError`] if the pairing exchange fails on the client side.
-pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
-   connection.send_datagram(AuthCommands::PAIR.into())?;
-   pair_peer(connection, None).await
 }
 
 /// Server side of the handshake: accepts an incoming QUIC connection and
@@ -608,9 +305,7 @@ pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
 /// the pairing is rejected, or an invalid command is received, and
 /// [`QuicError`] for stream or connection failures. On a handshake timeout
 /// the connection is closed with [`CloseCode::AuthenticationFailure`].
-#[instrument(skip(incoming, pair_mode))] // pair_mode doesn't matter here
-pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result<Connection> {
-   use AuthError::{HandshakeTimeout, InvalidAuthData};
+pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    use CloseCode::AuthenticationFailure;
    let mut connection = incoming.await?;
    let handshake_packet = match timeout(Duration::from_secs(5), connection.read_datagram()).await {
@@ -717,11 +412,6 @@ mod tests {
          .expect("failed to pair peer");
    }
 
-   async fn responding_peer(incoming: Incoming, pair_mode: PairMode) {
-      handle_incoming(incoming, &pair_mode)
-         .await
-         .expect("failed to handle incoming connection");
-   }
 
    #[tokio::test]
    async fn test_pair_peer_relaxed() {
@@ -748,10 +438,6 @@ mod tests {
          .expect("failed to connect to server");
       let mut task_set = JoinSet::new();
       task_set.spawn(connecting_peer(connection));
-      task_set.spawn(responding_peer(
-         server.accept().await.expect("failed to accept connection"),
-         PairMode::Relaxed,
-      ));
       task_set.join_all().await;
    }
    // I still need to figure out how to write the other tests

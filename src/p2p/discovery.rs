@@ -236,8 +236,7 @@ mod tests {
    use crate::{
       CONFIG_DIR,
       p2p::auth::{
-         KNOWN_PEERS_LOCK, PairMode, configure_client, configure_server, get_peer_id,
-         handle_incoming,
+         KNOWN_PEERS_LOCK, configure_client, configure_server, get_peer_id, handle_incoming,
       },
    };
    use std::{
@@ -587,7 +586,7 @@ mod tests {
 
       let server_task = tokio::task::spawn(async move {
          let incoming = server.accept().await.expect("no incoming connection");
-         handle_incoming(incoming, &PairMode::Relaxed)
+         handle_incoming(incoming)
             .await
             .expect("failed to handle incoming connection");
       });
