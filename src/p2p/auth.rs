@@ -272,13 +272,7 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
    channel_rx.read_exact(&mut response_code).await?;
 
    if response_code == AuthCommands::REJECT {
-      if let Some(ApplicationClosed(close_packet)) = connection.close_reason() {
-         return Err(RejectedByPeer(
-            String::from_utf8_lossy(&close_packet.reason).to_string(),
-         ));
-      };
-
-      return Err(RejectedByPeer("unknown reason".to_string()));
+      return Err(connection.closed().await.into());
    }
    Ok(connection)
 }
