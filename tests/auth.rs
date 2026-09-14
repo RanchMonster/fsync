@@ -1,57 +1,97 @@
-use fsync::p2p::auth::{AuthCommands, configure_client, configure_server, handle_incoming};
-use quinn::{Connecting, Incoming};
-use tokio::task::JoinSet;
+use std::{
+   fs,
+   net::SocketAddr,
+   str::FromStr,
+   sync::{Once, OnceLock},
+};
+
+use fsync::{
+   DATA_DIR,
+   p2p::auth::{
+      AuthCommands, AuthError, PeerId, configure_client, configure_server, generate_pairing_key,
+      get_peer_id, handle_connecting, handle_incoming, is_known_peer, pair_peer,
+   },
+};
+use quinn::{Connecting, Connection, Endpoint, Incoming};
+use tokio::task;
 
 const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
-static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn setup_config_dir() {
-   // Point CONFIG_DIR at a temp directory so the tests don't touch the real
-   // config directory. Must be called before CONFIG_DIR is first used.
-   let dir = std::env::temp_dir().join("fsync-p2p-auth-tests");
-   unsafe {
-      std::env::set_var("FSYNC_CONFIG_DIR", &dir);
+fn setup() -> &'static Endpoint {
+   static ONCE: OnceLock<Endpoint> = OnceLock::new();
+   ONCE.get_or_init(|| {
+      // Point CONFIG_DIR at a temp directory so the tests don't touch the real
+      // config directory. Must be called before CONFIG_DIR is first used.
+      let dir = std::env::temp_dir().join("fsync-p2p-auth-tests");
+      let items = fs::read_dir(&dir).map(|dir| dir.count()).unwrap_or(0);
+      println!("items: {items}");
+      unsafe {
+         std::env::set_var("FSYNC_CONFIG_DIR", &dir);
+         std::env::set_var("FSYNC_DATA_DIR", &dir);
+      }
+      // generate key and cert for virtual peers
+      let server_config =
+         configure_server("test-peer-server").expect("failed to configure server crypto");
+      let client_config =
+         configure_client("test-peer-client").expect("failed to configure client crypto");
+      let mut endpoint = quinn::Endpoint::server(
+         server_config,
+         TEST_SOCKET_ADDR.parse().expect("invalid socket addr"),
+      )
+      .expect("failed to create server endpoint");
+      endpoint.set_default_client_config(client_config);
+      endpoint
+   })
+}
+
+async fn accept_task(endpoint: &'static Endpoint) {
+   loop {
+      let incoming = endpoint.accept().await.expect("no incoming connection");
+      let _ = handle_incoming(incoming).await;
    }
 }
 
-async fn connecting_peer(connect_attempt: Connecting) {
-   todo!("Implement connecting_peer");
-}
+async fn pair_task(endpoint: &'static Endpoint, addr: SocketAddr) -> Result<(), AuthError> {
+   let pairing_key = generate_pairing_key().expect("failed to generate pairing key");
+   let connecting = endpoint
+      .connect(addr, "test-peer-client")
+      .expect("failed to connect");
 
-async fn responding_peer(incoming: Incoming) {
-   handle_incoming(incoming)
-      .await
-      .expect("failed to handle incoming connection");
+   pair_peer(connecting, || Some(pairing_key)).await?;
+   Ok(())
+}
+async fn connect_task(endpoint: &'static Endpoint, addr: SocketAddr) -> Result<(), AuthError> {
+   let connecting = endpoint
+      .connect(addr, "test-peer-server")
+      .expect("failed to connect");
+   handle_connecting(connecting).await?;
+   Ok(())
 }
 
 #[tokio::test]
-async fn test_pair_peer_relaxed() {
-   use quinn::Endpoint;
-   setup_config_dir();
-   let _guard = KNOWN_PEERS_LOCK
-      .lock()
-      .unwrap_or_else(|poisoned| poisoned.into_inner());
-   // generate key and cert for virtual peers
-   let server_config =
-      configure_server("test-peer-server").expect("failed to configure server crypto");
-   let client_config =
-      configure_client("test-peer-client").expect("failed to configure client crypto");
-   // initialize the quic server
-   let server = Endpoint::server(
-      server_config,
-      TEST_SOCKET_ADDR.parse().expect("invalid socket addr"),
-   )
-   .expect("failed to create server endpoint");
+async fn main() {
+   let endpoint = setup();
+   let local_addr = endpoint.local_addr().expect("failed to get local addr");
+   {
+      let hex_encoded_peer_id = get_peer_id("test-peer-client").expect("failed to get peer id");
+      let peer_id = PeerId::from_str(&hex_encoded_peer_id).expect("failed to parse peer id");
+      println!("data dir: {}", DATA_DIR.display());
+      assert!(
+         !is_known_peer(&peer_id).expect("failed to check peer id"),
+         "peer should not be known at this point"
+      );
+   }
 
-   // reuse the same endpoint to connect to the host peer
-   let local_addr = server.local_addr().expect("failed to get local addr");
-   let connection = server
-      .connect_with(client_config, local_addr, "test-peer-server")
-      .expect("failed to connect to server");
-   let mut task_set = JoinSet::new();
-   task_set.spawn(connecting_peer(connection));
-   task_set.spawn(responding_peer(
-      server.accept().await.expect("failed to accept connection"),
-   ));
-   task_set.join_all().await;
+   // spawn a task to accept connections
+   task::spawn(accept_task(endpoint));
+   if connect_task(endpoint, local_addr).await.is_ok() {
+      panic!("Peer connected without being known");
+   }
+   pair_task(endpoint, local_addr)
+      .await
+      .expect("Failed to pair");
+
+   connect_task(endpoint, local_addr)
+      .await
+      .expect("Failed to reconnect after pairing")
 }

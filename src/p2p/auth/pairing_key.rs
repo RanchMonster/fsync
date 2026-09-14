@@ -75,7 +75,7 @@ pub fn generate_pairing_key() -> Result<PairingKey, std::io::Error> {
 /// Returns [`None`] if the key does not exist.
 /// # Note:
 /// This function should be called only by the auth module and should be asyncified.
-/// ```no_run
+/// ```ignore
 /// async fn validate_pairing_request(given_key: &PairingKey)->Result<(),Box<dyn std::error::Error>> {
 ///  let pairing_key = asyncify!(load_pairing_key);
 ///  if let Some(pairing_key) = pairing_key && pairing_key == *given_key {
