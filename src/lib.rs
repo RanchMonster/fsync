@@ -37,7 +37,7 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       if !path.exists() {
          create_dir_all(&path).expect("Failed to create config dir.");
       }
-      return path;
+      path
    }
 });
 
@@ -66,7 +66,7 @@ pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       if !path.exists() {
          create_dir_all(&path).expect("Failed to create data dir.");
       }
-      return path;
+      path
    }
 });
 
