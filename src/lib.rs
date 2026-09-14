@@ -5,7 +5,7 @@ pub use crate::config::Config;
 
 use std::{fs::create_dir_all, path::PathBuf, sync::LazyLock};
 
-#[cfg(test)]
+#[cfg(debug_assertions)]
 use std::fs::remove_dir_all;
 
 /// The asyncfiy macro is a convenience macro for wrapping a sync function in a tokio blocing task
@@ -32,22 +32,17 @@ macro_rules! asyncify {
 /// The location can be overridden with the `FSYNC_CONFIG_DIR` environment
 /// variable, which tests use to avoid touching the real config directory.
 pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-   #[cfg(test)]
+   #[cfg(debug_assertions)]
    {
-      let path = std::env::var_os("FSYNC_CONFIG_DIR")
-         .map(PathBuf::from)
-         .unwrap_or_else(|| {
-            dirs::home_dir()
-               .expect("Failed to find home directory")
-               .join(".fsync")
-         });
-      if path.exists() {
-         remove_dir_all(&path).expect("Failed to remove old config dir.");
+      let process_id = std::process::id();
+      let debug_dir = std::env::temp_dir().join(format!("fsync-config-{process_id}"));
+      if debug_dir.exists() {
+         remove_dir_all(&debug_dir).expect("Failed to remove old config dir.");
       }
-      create_dir_all(&path).expect("Failed to create config dir.");
-      return path;
+      create_dir_all(&debug_dir).expect("Failed to create config dir.");
+      return debug_dir;
    }
-   #[cfg(not(test))]
+   #[cfg(not(debug_assertions))]
    {
       let path = dirs::config_local_dir()
          .expect("Failed to find config directory")
@@ -55,28 +50,22 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       if !path.exists() {
          create_dir_all(&path).expect("Failed to create config dir.");
       }
-      return path;
+      path
    }
 });
 
 pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-   #[cfg(test)]
+   #[cfg(debug_assertions)]
    {
-      let path = std::env::var_os("FSYNC_DATA_DIR")
-         .map(PathBuf::from)
-         .unwrap_or_else(|| {
-            dirs::home_dir()
-               .expect("Failed to find home directory")
-               .join(".fsync")
-         });
-      if path.exists() {
-         remove_dir_all(&path).expect("Failed to remove old data dir.");
+      let process_id = std::process::id();
+      let debug_dir = std::env::temp_dir().join(format!("fsync-data-{process_id}"));
+      if debug_dir.exists() {
+         remove_dir_all(&debug_dir).expect("Failed to remove old data dir.");
       }
-
-      create_dir_all(&path).expect("Failed to create data dir.");
-      return path;
+      create_dir_all(&debug_dir).expect("Failed to create data dir.");
+      return debug_dir;
    }
-   #[cfg(not(test))]
+   #[cfg(not(debug_assertions))]
    {
       let path = dirs::data_local_dir()
          .expect("Failed to find data directory")
@@ -84,26 +73,21 @@ pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       if !path.exists() {
          create_dir_all(&path).expect("Failed to create data dir.");
       }
-      return path;
+      path
    }
 });
 pub static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-   #[cfg(test)]
+   #[cfg(debug_assertions)]
    {
-      let path = std::env::var_os("FSYNC_CACHE_DIR")
-         .map(PathBuf::from)
-         .unwrap_or_else(|| {
-            dirs::home_dir()
-               .expect("Failed to find home directory")
-               .join(".fsync")
-         });
-      if path.exists() {
-         remove_dir_all(&path).expect("Failed to remove old cache dir.");
+      let process_id = std::process::id();
+      let debug_dir = std::env::temp_dir().join(format!("fsync-cache-{process_id}"));
+      if debug_dir.exists() {
+         remove_dir_all(&debug_dir).expect("Failed to remove old cache dir.");
       }
-      create_dir_all(&path).expect("Failed to create cache dir.");
-      return path;
+      create_dir_all(&debug_dir).expect("Failed to create cache dir.");
+      return debug_dir;
    }
-   #[cfg(not(test))]
+   #[cfg(not(debug_assertions))]
    {
       let path = dirs::cache_dir()
          .expect("Failed to find cache directory")
@@ -111,7 +95,7 @@ pub static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
       if !path.exists() {
          create_dir_all(&path).expect("Failed to create cache dir.");
       }
-      return path;
+      path
    }
 });
 
