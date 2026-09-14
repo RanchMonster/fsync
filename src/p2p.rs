@@ -1,7 +1,7 @@
 pub mod auth;
+mod close_code;
 mod discovery;
-mod error;
-use auth::{AuthError, configure_client, configure_server, get_peer_id, handle_incoming};
+use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
 use discovery::{advertise_local_client, handle_event};
 use quinn::Endpoint;
 use std::collections::HashSet;
@@ -74,10 +74,6 @@ pub async fn start_service(config: &'static Config) -> ! {
                Ok(_connection) => {
                   tracing::debug!("Connection accepted, handling is not implemented yet");
                }
-               Err(err) => match err {
-                  AuthError::Quic(quic_error) => {
-                     tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}");
-                  }
                   reason => {
                      tracing::warn!("Rejected connection to {local_addr:?}: {reason}");
                   }
