@@ -16,7 +16,20 @@ const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
-
+fn handle_incoming_detached(incoming: Incoming) {
+   task::spawn(async move {
+      // the error is handled for us via instrumentation on the functions
+      // see [tracing::instrument](https://docs.rs/tracing/latest/tracing/attr.instrument.html)
+      // for more information
+      let Ok(_connection) = handle_incoming(incoming).await else {
+         return;
+      };
+      #[cfg(not(debug_assertions))]
+      compile_error!(
+         "There is not current handling for incoming connections this must be implemented for production"
+      );
+   });
+}
 pub async fn start_service(config: &'static Config) -> ! {
    // load args from the config given
    let hostname = config.hostname.clone();
@@ -69,16 +82,7 @@ pub async fn start_service(config: &'static Config) -> ! {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
 
-
-            match handle_incoming(incoming).await {
-               Ok(_connection) => {
-                  tracing::debug!("Connection accepted, handling is not implemented yet");
-               }
-                  reason => {
-                     tracing::warn!("Rejected connection to {local_addr:?}: {reason}");
-                  }
-               },
-            }
+            handle_incoming_detached(incoming);
          }
          event = browser.recv_async() => {
             let event = event.expect("Unexpectedly closed mdns browser");

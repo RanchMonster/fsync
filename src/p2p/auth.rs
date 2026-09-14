@@ -14,8 +14,10 @@
 //! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
-use argon2::PasswordVerifier;
-use quinn::{Connecting, Connection, ConnectionError, Incoming};
+use quinn::{
+   Connecting, Connection, ConnectionError, Incoming, ReadError, ReadExactError, StoppedError,
+   WriteError,
+};
 use std::{
    fmt::Display,
    fs::File,
@@ -24,7 +26,6 @@ use std::{
 };
 use thiserror::Error;
 use tracing::instrument;
-use x509_parser::nom::AsBytes;
 
 use super::close_code::CloseCode;
 use crate::{DATA_DIR, asyncify, p2p::auth::pairing_key::load_pairing_key};
@@ -37,9 +38,7 @@ mod pairing_key;
 /// Re-exports the mTLS server and client config builders from the `mtls`
 /// submodule.
 pub use mtls::{configure_client, configure_server, get_peer_id};
-
-const MAX_PASSWORD_ATTEMPTS: u32 = 5;
-const MAX_PASSWORD_LENGTH: usize = 256;
+pub use pairing_key::{PairingKey, generate_pairing_key};
 
 /// Errors that can occur during peer authentication and pairing.
 #[derive(Error, Debug)]
@@ -58,6 +57,8 @@ pub enum AuthError {
    InvalidAuthData,
    #[error("invalid pairing key: {0}")]
    InvalidPairingKey(#[source] hex::FromHexError),
+   #[error("no pairing key")]
+   NoPairingKey,
    #[error("failed to load pairing key")]
    PairingKeyLoadFailed(#[source] std::io::Error),
    #[error("too many pairing attempts")]
@@ -137,6 +138,8 @@ pub fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
    let known_peers_file = BufReader::new(file);
 
    for line in known_peers_file.lines() {
+      tracing::debug!("LINE: {line:?}");
+
       let line = line.map_err(KnownPeersCheckFailed)?;
 
       let stored_peer_id = PeerId::from_str(&line).expect(
@@ -159,7 +162,7 @@ fn add_known_peer(peer: PeerId) -> Result<()> {
       return Ok(());
    }
 
-   let result = (|| {
+   (|| {
       let mut file = File::options()
          .read(true)
          .append(true)
@@ -178,9 +181,7 @@ fn add_known_peer(peer: PeerId) -> Result<()> {
       writeln!(file, "{}", peer)?;
       Ok(())
    })()
-   .map_err(KnownPeersCheckFailed);
-
-   result
+   .map_err(KnownPeersCheckFailed)
 }
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
@@ -218,7 +219,7 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 pub async fn validate_peer(connection: &mut Connection) -> Result<()> {
    use AuthError::UnknownPeer;
    let peer_id = peer_key_hash(connection)?;
-   if asyncify!(is_known_peer, &peer_id)? {
+   if !asyncify!(is_known_peer, &peer_id)? {
       return Err(UnknownPeer);
    }
    Ok(())
@@ -228,7 +229,70 @@ fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
    if let Some(pairing_key) = load_pairing_key()? {
       return Ok(pairing_key == pair_code);
    }
-   return Ok(false);
+   Ok(false)
+}
+
+#[instrument(skip(connecting, get_pairing_key), err)]
+pub async fn pair_peer(
+   connecting: Connecting, get_pairing_key: impl Fn() -> Option<PairingKey> + Send + Sync,
+) -> Result<()> {
+   use AuthError::{InvalidAuthData, NoPairingKey, RejectedByPeer};
+   use CloseCode::AuthenticationFailure;
+   use ConnectionError::ApplicationClosed;
+
+   const _: () = assert!(
+      AuthCommands::REJECT.len() == AuthCommands::ACCEPT.len(),
+      "Reject and Accept codes must be the same length"
+   );
+
+   let connection = connecting.await?;
+   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   channel_tx.write_all(AuthCommands::PAIR).await?;
+
+   let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
+
+   tracing::debug!("Response code: {}", String::from_utf8_lossy(&response_code));
+
+   while connection.close_reason().is_none() {
+      let pair_code = get_pairing_key().ok_or(NoPairingKey)?;
+
+      tracing::debug!("Attempting pairing with code: {}", pair_code);
+
+      channel_tx
+         .write_all(format!("{pair_code}").as_bytes())
+         .await?;
+
+      channel_rx.read_exact(&mut response_code).await?;
+
+      if response_code == AuthCommands::ACCEPT {
+         let peer_id = peer_key_hash(&connection)?;
+         asyncify!(add_known_peer, peer_id)?;
+
+         return Ok(());
+      }
+
+      if response_code != AuthCommands::REJECT {
+         connection.close(
+            AuthenticationFailure.into(),
+            InvalidAuthData.to_string().as_bytes(),
+         );
+         return Err(InvalidAuthData);
+      }
+   }
+
+   let close_reason = connection
+      .close_reason()
+      .expect("connection should be closed by now");
+
+   if let ApplicationClosed(close_packet) = &close_reason
+      && close_packet.error_code == AuthenticationFailure.into()
+   {
+      return Err(RejectedByPeer(
+         String::from_utf8_lossy(&close_packet.reason).to_string(),
+      ));
+   }
+
+   Err(close_reason.into())
 }
 
 /// Client side of the authenticated handshake: announces that we are a known
@@ -242,10 +306,12 @@ fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
 ///
 /// Returns [`AuthError`] if the peer is not a known peer or the server does
 /// not acknowledge the connection within the timeout.
+#[instrument(skip(connecting), err)]
 pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
    use CloseCode::AuthenticationFailure;
+
    let mut connection = connecting.await?;
-   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
 
    channel_tx.write_all(AuthCommands::INIT).await?;
 
@@ -256,9 +322,10 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
    let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
    channel_rx.read_exact(&mut response_code).await?;
 
-   if response_code == AuthCommands::REJECT {
+   if response_code != AuthCommands::ACCEPT {
       return Err(connection.closed().await.into());
    }
+
    Ok(connection)
 }
 
@@ -282,24 +349,28 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
 /// the pairing is rejected, or an invalid command is received, and
 /// [`QuicError`] for stream or connection failures. On a handshake timeout
 /// the connection is closed with [`CloseCode::AuthenticationFailure`].
+#[instrument(skip(incoming), err)]
 pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    use AuthError::{InvalidAuthData, TooManyPairingAttempts};
    use CloseCode::AuthenticationFailure;
    const _: () = assert!(AuthCommands::INIT.len() == AuthCommands::PAIR.len());
 
    let mut connection = incoming.await?;
-   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
    let mut mode_buf = [0u8; AuthCommands::INIT.len()];
    channel_rx.read_exact(&mut mode_buf).await?;
+
+   tracing::debug!("Mode: {}", String::from_utf8_lossy(&mode_buf));
 
    if mode_buf == AuthCommands::INIT {
       if let Err(error) = validate_peer(&mut connection).await {
          channel_tx.write_all(AuthCommands::REJECT).await?;
-
          connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
          return Err(error);
       }
 
+      channel_tx.write_all(AuthCommands::ACCEPT).await?;
+      channel_tx.stopped().await?;
       return Ok(connection);
    }
 
@@ -310,15 +381,31 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    }
 
    let mut connect_attempts = 0;
-   let mut pair_code = [0; 32];
+   let mut hex_encoded_pair_code = [0; 64];
 
    while connect_attempts < 5 {
-      channel_rx.read_exact(&mut pair_code).await?;
-      if let Ok(true) = validate_pair_code(pair_code.into()) {
+      channel_rx.read_exact(&mut hex_encoded_pair_code).await?;
+
+      let pair_code = str::from_utf8(&hex_encoded_pair_code)
+         .map_err(|_| InvalidAuthData)?
+         .parse::<PairingKey>()
+         .map_err(|_| InvalidAuthData)?;
+
+      tracing::debug!("Incoming Pair code: {}", pair_code);
+
+      if let Ok(true) = validate_pair_code(pair_code) {
+         let peer_id = peer_key_hash(&connection)?;
+         asyncify!(add_known_peer, peer_id)?;
+
+         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+         if let Err(error) = channel_tx.stopped().await {
+            connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
+         }
          return Ok(connection);
       }
       connect_attempts += 1;
    }
+   connection.close(AuthenticationFailure.into(), b"Too many pairing attempts");
 
    Err(TooManyPairingAttempts)
 }
