@@ -26,14 +26,8 @@ use thiserror::Error;
 use tracing::instrument;
 use x509_parser::nom::AsBytes;
 
-use super::error::CloseCode;
-use crate::{
-   DATA_DIR, asyncify,
-   p2p::{
-      auth::pairing_key::{PairingKey, load_pairing_key},
-      error::QuicError,
-   },
-};
+use super::close_code::CloseCode;
+use crate::{DATA_DIR, asyncify, p2p::auth::pairing_key::load_pairing_key};
 
 #[cfg(test)]
 pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -58,12 +52,6 @@ pub enum AuthError {
    KnownPeersCheckFailed(#[source] std::io::Error),
    #[error("peer is not a known peer")]
    UnknownPeer,
-   #[error("Key mismatch")]
-   KeyMismatch,
-   #[error("failed to register peer: {0}")]
-   FailedToRegisterPeer(#[source] std::io::Error),
-   #[error("peer connection timed out")]
-   PeerTimeout,
    #[error("rejected by peer due to {0}")]
    RejectedByPeer(String),
    #[error("invalid auth handshake data")]
@@ -75,18 +63,17 @@ pub enum AuthError {
    #[error("too many pairing attempts")]
    TooManyPairingAttempts,
    #[error(transparent)]
-   Quic(QuicError),
+   WriteError(#[from] WriteError),
+   #[error(transparent)]
+   ReadError(#[from] ReadError),
+   #[error(transparent)]
+   ReadExactError(#[from] ReadExactError),
+   #[error(transparent)]
+   ConnectionError(#[from] ConnectionError),
+   #[error(transparent)]
+   StoppedError(#[from] StoppedError),
 }
 
-/// Simple wrapper to handle for all QUIC errors.
-impl<T> From<T> for AuthError
-where
-   T: Into<QuicError>,
-{
-   fn from(err: T) -> Self {
-      Self::Quic(err.into())
-   }
-}
 /// Define the result type for this module.
 type Result<T, E = AuthError> = std::result::Result<T, E>;
 
@@ -256,9 +243,7 @@ fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
 /// Returns [`AuthError`] if the peer is not a known peer or the server does
 /// not acknowledge the connection within the timeout.
 pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
-   use AuthError::RejectedByPeer;
    use CloseCode::AuthenticationFailure;
-   use ConnectionError::ApplicationClosed;
    let mut connection = connecting.await?;
    let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
 
