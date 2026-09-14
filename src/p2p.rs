@@ -3,7 +3,7 @@ mod close_code;
 mod discovery;
 use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
 use discovery::{advertise_local_client, handle_event};
-use quinn::Endpoint;
+use quinn::{Endpoint, Incoming};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::Mutex;
