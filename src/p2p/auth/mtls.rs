@@ -3,7 +3,7 @@
 //! This module builds the quinn TLS configs used by fsync's endpoints.
 //! Because fsync peers do not have certificates issued by a shared CA, each
 //! device generates a self-signed certificate on first use and caches it (and
-//! its key) by `name` in `CONFIG_DIR/certs`, giving a device a stable
+//! its key) by `name` in `DATA_DIR/certs`, giving a device a stable
 //! identity across restarts.
 //!
 //! [`configure_server`] enables client authentication with a verifier that
@@ -11,7 +11,7 @@
 //! [`configure_client`] skips server certificate validation entirely. Peer
 //! authenticity is instead established by the application-layer handshake in
 //! the parent `p2p_auth` module.
-use crate::{CONFIG_DIR, p2p::discovery::HEX_ENCODED_PEER_ID_LENGTH};
+use crate::{DATA_DIR, p2p::discovery::HEX_ENCODED_PEER_ID_LENGTH};
 use quinn::{
    ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -29,11 +29,11 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const PROTOCOL_NAME: &str = concat!("fsync", env!("CARGO_PKG_VERSION"));
 
 /// Returns the on-disk paths for the cached certificate and private key for
-/// the given name, creating the `CONFIG_DIR/certs` directory (permissioned
+/// the given name, creating the `DATA_DIR/certs` directory (permissioned
 /// `0o700` on unix) if it does not exist.
 #[instrument]
 pub fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
-   let dir = CONFIG_DIR.join("certs");
+   let dir = DATA_DIR.join("certs");
    fs::create_dir_all(&dir)?;
    #[cfg(unix)]
    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -47,7 +47,7 @@ pub fn cache_path(name: &str) -> std::io::Result<(PathBuf, PathBuf)> {
 /// name, generating and caching them on first use.
 ///
 /// If both the cached cert and key files already exist under
-/// `CONFIG_DIR/certs`, they are loaded and returned instead of regenerated.
+/// `DATA_DIR/certs`, they are loaded and returned instead of regenerated.
 /// Otherwise a new self-signed certificate (with the name as its DNS subject
 /// alternative name) is generated, written to disk, and returned.
 ///
@@ -295,7 +295,7 @@ mod tests {
    #[test]
    fn test_cache_path() {
       let (cert_path, key_path) = cache_path("test-node").expect("Failed to get cache path");
-      let dir = CONFIG_DIR.join("certs");
+      let dir = DATA_DIR.join("certs");
       assert_eq!(cert_path, dir.join("test-node.cert.der"));
       assert_eq!(key_path, dir.join("test-node.key.der"));
    }
