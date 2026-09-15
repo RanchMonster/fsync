@@ -14,6 +14,7 @@
 //! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
+use blake3::Hash;
 use quinn::{
    Connecting, Connection, ConnectionError, Incoming, ReadError, ReadExactError, StoppedError,
    WriteError,
@@ -28,7 +29,10 @@ use thiserror::Error;
 use tracing::instrument;
 
 use super::close_code::CloseCode;
-use crate::{DATA_DIR, asyncify, p2p::auth::pairing_key::load_pairing_key};
+use crate::{
+   DATA_DIR, asyncify,
+   p2p::{PeerId, auth::pairing_key::load_pairing_key},
+};
 
 #[cfg(test)]
 pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -88,27 +92,6 @@ impl AuthCommands {
    pub const ACCEPT: &[u8] = b"ACCEPT";
    pub const PAIR: &[u8] = b"PAIR";
 }
-
-/// A peer identity: the blake3 hash of a peer certificate's public key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-pub struct PeerId(pub [u8; 32]);
-
-impl FromStr for PeerId {
-   type Err = hex::FromHexError;
-   fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
-      let key_hash = hex::decode(line)?
-         .try_into()
-         .map_err(|_| hex::FromHexError::InvalidStringLength)?;
-      Ok(PeerId(key_hash))
-   }
-}
-
-impl Display for PeerId {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      write!(f, "{}", hex::encode(self.0))
-   }
-}
-
 /// Checks whether the given key hash is present in the known peers list
 /// stored in `DATA_DIR/known_peers`. A missing file is treated as an empty
 /// list, so this returns `false` rather than panicking.
