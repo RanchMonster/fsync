@@ -1,6 +1,6 @@
 pub mod auth;
 mod close_code;
-mod discovery;
+mod network;
 use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
 use discovery::{advertise_local_client, handle_event};
 use quinn::{Endpoint, Incoming};
@@ -62,43 +62,9 @@ pub async fn start_service(config: &'static Config) -> ! {
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
 
-   let peer_id = get_peer_id(&hostname).expect("Failed to get peer id");
-   tracing::debug!("Advertising {hostname} as {peer_id}");
-
-   // start the advertisement daemon
-   let advertising_daemon = advertise_local_client(local_addr, hostname, &peer_id).await;
-   tracing::debug!("Looking for peers");
-
-   let browser = advertising_daemon
-      .browse(SERVICE_TYPE)
-      .expect("Failed to browse for peers");
-
-   // Define event loop variables
-   let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
-   // event loop for the service
    loop {
-      tokio::select! {
-         accept = endpoint.accept() => {
-            let incoming = accept.expect("Server closed unexpectedly");
-            tracing::debug!("Accepted connection {incoming:?}");
-
-            handle_incoming_detached(incoming);
-         }
-         event = browser.recv_async() => {
-            let event = event.expect("Unexpectedly closed mdns browser");
-            let discovered_peers = discovered_peers.clone();
-            let endpoint = endpoint.clone();
-
-            match task::spawn(handle_event(event, endpoint, discovered_peers))
-               .await
-               .expect("Thread unexpectedly panicked")
-            {
-               Ok(_) => continue,
-               Err(err) => {
-                  tracing::error!("Failed to handle service event: {err}");
-               }
-            }
-         }
-      }
+      let accept = endpoint.accept().await.expect("Server closed unexpectedly");
+      tracing::debug!("Accepted connection {accept:?}");
+      handle_incoming_detached(accept);
    }
 }
