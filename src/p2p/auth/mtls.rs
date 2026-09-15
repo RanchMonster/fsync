@@ -11,7 +11,10 @@
 //! [`configure_client`] skips server certificate validation entirely. Peer
 //! authenticity is instead established by the application-layer handshake in
 //! the parent `p2p_auth` module.
-use crate::{DATA_DIR, p2p::discovery::HEX_ENCODED_PEER_ID_LENGTH};
+use crate::{
+   DATA_DIR,
+   p2p::{HEX_ENCODED_PEER_ID_LENGTH, auth::PeerId},
+};
 use quinn::{
    ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -93,19 +96,14 @@ pub fn generate_self_signed_cert(
 /// Returns the peer id of the certificate with the given name.
 /// The certificate must have been generated with [`generate_self_signed_cert`].
 /// The peer id is the blake3 hash encoded as a hex string.
-pub fn get_peer_id(name: &str) -> Result<String> {
+pub fn get_peer_id(name: &str) -> Result<PeerId> {
    let (cert_path, _) = generate_self_signed_cert(name)?;
    assert_eq!(cert_path.len(), 1, "Cert path should have one element");
    let raw_cert = &cert_path[0];
    let (_, parsed_cert) = x509_parser::parse_x509_certificate(raw_cert)?;
    let public_key = parsed_cert.public_key().raw;
    let peer_id = blake3::hash(public_key);
-   let hex_encoded_peer_id = hex::encode(peer_id.as_bytes());
-   assert!(
-      hex_encoded_peer_id.len() == HEX_ENCODED_PEER_ID_LENGTH,
-      "Peer id must be the correct length"
-   );
-   Ok(hex_encoded_peer_id)
+   Ok(PeerId::from(peer_id))
 }
 
 /// Verifies a TLS 1.2 handshake signature against the given certificate using
@@ -408,23 +406,6 @@ mod tests {
    }
 
    #[test]
-   fn test_get_peer_id_is_hex_encoded() {
-      let name = "test-peer-id-hex";
-      clear_certs(name);
-
-      let peer_id = get_peer_id(name).expect("failed to get peer id");
-      assert_eq!(
-         peer_id.len(),
-         HEX_ENCODED_PEER_ID_LENGTH,
-         "peer id must be {HEX_ENCODED_PEER_ID_LENGTH} characters long"
-      );
-      assert!(
-         hex::decode(&peer_id).is_ok(),
-         "peer id must be valid hex: {peer_id:?}"
-      );
-   }
-
-   #[test]
    fn test_get_peer_id_deterministic() {
       let name = "test-peer-id-deterministic";
       clear_certs(name);
@@ -464,7 +445,8 @@ mod tests {
          x509_parser::parse_x509_certificate(&cert_bytes).expect("failed to parse cached cert");
       let expected = hex::encode(blake3::hash(cert.public_key().raw).as_bytes());
       assert_eq!(
-         peer_id, expected,
+         peer_id.to_string(),
+         expected,
          "peer id must be the blake3 hash of the certificate public key"
       );
    }
