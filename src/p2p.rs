@@ -2,20 +2,45 @@ pub mod auth;
 mod close_code;
 mod network;
 use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
-use discovery::{advertise_local_client, handle_event};
+use blake3::Hash;
 use quinn::{Endpoint, Incoming};
 use std::collections::HashSet;
+use std::fmt::Display;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::{self};
 
 use crate::Config;
 
-const SERVICE_TYPE: &str = "_fsync._udp.local.";
-const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
-
+pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
+
+/// A peer identity: the blake3 hash of a peer certificate's public key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+pub struct PeerId(pub [u8; 32]);
+impl From<Hash> for PeerId {
+   fn from(hash: Hash) -> Self {
+      Self(*hash.as_bytes())
+   }
+}
+impl FromStr for PeerId {
+   type Err = hex::FromHexError;
+   fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
+      let key_hash = hex::decode(line)?
+         .try_into()
+         .map_err(|_| hex::FromHexError::InvalidStringLength)?;
+      Ok(PeerId(key_hash))
+   }
+}
+
+impl Display for PeerId {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      write!(f, "{}", hex::encode(self.0))
+   }
+}
+
 fn handle_incoming_detached(incoming: Incoming) {
    task::spawn(async move {
       // the error is handled for us via instrumentation on the functions
