@@ -7,15 +7,20 @@ use quinn::{Endpoint, Incoming};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task::{self};
+use std::sync::{Arc, LazyLock};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::Config;
 
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
+
+/// keeps track of all the peers we are currently connected to we use this to prevent us from
+/// connecting to the same peer twice
+static CONNECTED_PEERS: LazyLock<RwLock<HashSet<PeerId>>> =
+   LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// A peer identity: the blake3 hash of a peer certificate's public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
@@ -40,7 +45,18 @@ impl Display for PeerId {
       write!(f, "{}", hex::encode(self.0))
    }
 }
-
+#[instrument(skip(connection))]
+fn log_on_disconnect(connection: &Connection, peer_id: PeerId) {
+   let connection = connection.clone();
+   task::spawn(
+      async move {
+         connection.closed().await;
+         CONNECTED_PEERS.write().await.remove(&peer_id);
+         tracing::info!("Peer disconnected");
+      }
+      .in_current_span(),
+   );
+}
 fn handle_incoming_detached(incoming: Incoming) {
    task::spawn(async move {
       // the error is handled for us via instrumentation on the functions
