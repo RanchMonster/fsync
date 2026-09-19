@@ -248,4 +248,7 @@ impl Network<ServiceResolvedInfo, EventError> for LocalNetwork {
          .expect("Watcher closed unexpectedly");
       Ok(self.found_peers.borrow().values().cloned().collect())
    }
+   fn network_name(&self) -> &str {
+      "local"
+   }
 }
