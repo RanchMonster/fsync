@@ -79,6 +79,7 @@ pub enum AuthError {
    StoppedError(#[from] StoppedError),
 }
 
+pub type ValidatedPeer = (Connection, PeerId);
 /// Define the result type for this module.
 type Result<T, E = AuthError> = std::result::Result<T, E>;
 
@@ -199,9 +200,8 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 /// # Errors
 ///
 /// Returns [`AuthError`] if the peer is not a known peer.
-pub async fn validate_peer(connection: &mut Connection) -> Result<()> {
+async fn validate_peer(connection: &mut Connection, peer_id: PeerId) -> Result<()> {
    use AuthError::UnknownPeer;
-   let peer_id = peer_key_hash(connection)?;
    if !asyncify!(is_known_peer, &peer_id)? {
       return Err(UnknownPeer);
    }
@@ -290,15 +290,15 @@ pub async fn pair_peer(
 /// Returns [`AuthError`] if the peer is not a known peer or the server does
 /// not acknowledge the connection within the timeout.
 #[instrument(skip(connecting), err)]
-pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
+pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> {
    use CloseCode::AuthenticationFailure;
 
    let mut connection = connecting.await?;
    let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
 
    channel_tx.write_all(AuthCommands::INIT).await?;
-
-   if let Err(error) = validate_peer(&mut connection).await {
+   let peer_id = peer_key_hash(&connection)?;
+   if let Err(error) = validate_peer(&mut connection, peer_id).await {
       connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
       return Err(error);
    }
@@ -309,7 +309,7 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
       return Err(connection.closed().await.into());
    }
 
-   Ok(connection)
+   Ok((connection, peer_id))
 }
 
 /// Server side of the handshake: accepts an incoming QUIC connection and
@@ -333,7 +333,7 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<Connection> {
 /// [`QuicError`] for stream or connection failures. On a handshake timeout
 /// the connection is closed with [`CloseCode::AuthenticationFailure`].
 #[instrument(skip(incoming), err)]
-pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
+pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    use AuthError::{InvalidAuthData, TooManyPairingAttempts};
    use CloseCode::AuthenticationFailure;
    const _: () = assert!(AuthCommands::INIT.len() == AuthCommands::PAIR.len());
@@ -344,9 +344,9 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
    channel_rx.read_exact(&mut mode_buf).await?;
 
    tracing::debug!("Mode: {}", String::from_utf8_lossy(&mode_buf));
-
+   let peer_id = peer_key_hash(&connection)?;
    if mode_buf == AuthCommands::INIT {
-      if let Err(error) = validate_peer(&mut connection).await {
+      if let Err(error) = validate_peer(&mut connection, peer_id).await {
          channel_tx.write_all(AuthCommands::REJECT).await?;
          connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
          return Err(error);
@@ -354,7 +354,7 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
 
       channel_tx.write_all(AuthCommands::ACCEPT).await?;
       channel_tx.stopped().await?;
-      return Ok(connection);
+      return Ok((connection, peer_id));
    }
 
    if mode_buf != AuthCommands::PAIR {
@@ -384,7 +384,7 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<Connection> {
          if let Err(error) = channel_tx.stopped().await {
             connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
          }
-         return Ok(connection);
+         return Ok((connection, peer_id));
       }
       connect_attempts += 1;
    }
