@@ -109,6 +109,10 @@ async fn network_handler<Member: NetworkMember + Send + Sync + 'static, Error: N
 
    todo!();
 }
+pub async fn is_connected(peer_id: &PeerId) -> bool {
+   CONNECTED_PEERS.read().await.contains(peer_id)
+}
+
 pub async fn start_service(config: &'static Config) -> ! {
    // load args from the config given
    let hostname = config.hostname.clone();
