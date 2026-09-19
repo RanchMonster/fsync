@@ -11,7 +11,9 @@ use tokio::task::{self};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::Config;
+use crate::p2p::network::local::LocalNetwork;
+use crate::p2p::network::{Network, NetworkError, NetworkMember};
+use crate::{Config, asyncify};
 
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
 pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
@@ -71,6 +73,41 @@ fn handle_incoming_detached(incoming: Incoming) {
          "There is not current handling for incoming connections this must be implemented for production"
       );
    });
+}
+
+#[instrument(err,skip(network,endpoint),fields(network=network.network_name()))]
+async fn network_handler<Member: NetworkMember + Send + Sync + 'static, Error: NetworkError>(
+   network: &mut impl Network<Member, Error>, endpoint: &Endpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
+   let connected_peers = CONNECTED_PEERS.read().await;
+   let network_members = network
+      .list_members()?
+      .into_iter()
+      .filter(|members| !connected_peers.contains(&members.id()))
+      .collect::<Vec<_>>();
+   for member in network_members {
+      let peer_id = member.id();
+      if !asyncify!(is_known_peer, &peer_id)? {
+         continue;
+      }
+      match network.connect(&endpoint, member).await {
+         Ok(connecting) => {
+            let Ok((_connection, peer_id_from_auth)) = handle_connecting(connecting).await else {
+               continue;
+            };
+            if peer_id != peer_id_from_auth {
+               // this likely means that someone is up to no good
+               tracing::warn!("The peer id doesn't match the public peer id");
+            }
+            todo!("pass the connection to the sync module");
+         }
+         Err(err) => {
+            tracing::error!("Failed to connect to peer: {err}");
+         }
+      }
+   }
+
+   todo!();
 }
 pub async fn start_service(config: &'static Config) -> ! {
    // load args from the config given
