@@ -3,14 +3,16 @@ mod close_code;
 mod network;
 use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
 use blake3::Hash;
-use quinn::{Endpoint, Incoming};
+use quinn::{Connection, Endpoint, Incoming};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
-use tokio::task::{self};
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
+use tokio::task::{self, JoinSet, LocalSet};
+use tracing::{Instrument, instrument};
 
+use crate::p2p::auth::{handle_connecting, is_known_peer};
 use crate::p2p::network::local::LocalNetwork;
 use crate::p2p::network::{Network, NetworkError, NetworkMember};
 use crate::{Config, asyncify};
@@ -144,6 +146,7 @@ pub async fn start_service(config: &'static Config) -> ! {
 
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
+   // let mut local_network = LocalNetwork::new(local_addr, peer_id, hostname);
 
    loop {
       let accept = endpoint.accept().await.expect("Server closed unexpectedly");
