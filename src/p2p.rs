@@ -62,9 +62,10 @@ fn handle_incoming_detached(incoming: Incoming) {
       // the error is handled for us via instrumentation on the functions
       // see [tracing::instrument](https://docs.rs/tracing/latest/tracing/attr.instrument.html)
       // for more information
-      let Ok(_connection) = handle_incoming(incoming).await else {
+      let Ok((connection, peer_id)) = handle_incoming(incoming).await else {
          return;
       };
+      log_on_disconnect(&connection, peer_id);
       #[cfg(not(debug_assertions))]
       compile_error!(
          "There is not current handling for incoming connections this must be implemented for production"
