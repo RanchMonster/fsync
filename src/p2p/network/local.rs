@@ -1,4 +1,3 @@
-use crate::asyncify;
 use crate::p2p::network::{Network, NetworkMember};
 use crate::p2p::{PeerId, VERSION_NUMBER};
 
@@ -6,7 +5,7 @@ use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInf
 use quinn::{ConnectError, Connecting, ConnectionError, Endpoint};
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr};
 use thiserror::Error;
 use tokio::{sync::watch, task};
 use tracing::instrument;
@@ -49,7 +48,7 @@ pub struct ServiceResolvedInfo {
 }
 impl NetworkMember for ServiceResolvedInfo {
    fn id(&self) -> PeerId {
-      self.peer_id.clone()
+      self.peer_id
    }
    fn name(&self) -> &str {
       self.hostname.as_str()
@@ -221,7 +220,7 @@ impl Network<ServiceResolvedInfo, EventError> for LocalNetwork {
    fn stop_advertising(&mut self) -> Result<()> {
       self
          .service_daemon
-         .unregister(&self.service_info.get_fullname())?;
+         .unregister(self.service_info.get_fullname())?;
       Ok(())
    }
 

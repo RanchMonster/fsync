@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Error as IoError, Read, Seek, Write};
+use std::io::{Error as IoError, Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -188,7 +187,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use std::fs;
+   
 
    #[test]
    fn test_default_config_creation_and_reading() {

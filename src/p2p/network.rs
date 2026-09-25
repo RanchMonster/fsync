@@ -1,5 +1,4 @@
 pub mod local;
-use std::fmt::Display;
 
 use quinn::{Connecting, Endpoint};
 
