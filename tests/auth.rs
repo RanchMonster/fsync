@@ -70,7 +70,7 @@ async fn connect_task(endpoint: &'static Endpoint, addr: SocketAddr) -> Result<(
 }
 
 #[tokio::test]
-async fn main() {
+async fn auth() {
    let endpoint = setup();
    let local_addr = endpoint.local_addr().expect("failed to get local addr");
    {
