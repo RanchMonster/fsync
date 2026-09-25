@@ -1,19 +1,17 @@
 use std::{
    fs,
    net::SocketAddr,
-   str::FromStr,
-   sync::{Once, OnceLock},
+   sync::OnceLock,
 };
 
 use fsync::{
    DATA_DIR,
-   p2p::PeerId,
    p2p::auth::{
-      AuthCommands, AuthError, configure_client, configure_server, generate_pairing_key,
+      AuthError, configure_client, configure_server, generate_pairing_key,
       get_peer_id, handle_connecting, handle_incoming, is_known_peer, pair_peer,
    },
 };
-use quinn::{Connecting, Connection, Endpoint, Incoming};
+use quinn::Endpoint;
 use tokio::task;
 
 const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues

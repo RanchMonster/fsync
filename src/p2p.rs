@@ -1,19 +1,18 @@
 pub mod auth;
 mod close_code;
 mod network;
-use auth::{configure_client, configure_server, get_peer_id, handle_incoming};
+use auth::{configure_client, configure_server, handle_incoming};
 use blake3::Hash;
 use quinn::{Connection, Endpoint, Incoming};
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::str::FromStr;
-use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::{self, JoinSet, LocalSet};
+use std::sync::LazyLock;
+use tokio::sync::RwLock;
+use tokio::task::{self};
 use tracing::{Instrument, instrument};
 
 use crate::p2p::auth::{handle_connecting, is_known_peer};
-use crate::p2p::network::local::LocalNetwork;
 use crate::p2p::network::{Network, NetworkError, NetworkMember};
 use crate::{Config, asyncify};
 
@@ -92,7 +91,7 @@ async fn network_handler<Member: NetworkMember + Send + Sync + 'static, Error: N
       if !asyncify!(is_known_peer, &peer_id)? {
          continue;
       }
-      match network.connect(&endpoint, member).await {
+      match network.connect(endpoint, member).await {
          Ok(connecting) => {
             let Ok((_connection, peer_id_from_auth)) = handle_connecting(connecting).await else {
                continue;
