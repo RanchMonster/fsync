@@ -7,8 +7,9 @@ use std::{
 
 use fsync::{
    DATA_DIR,
+   p2p::PeerId,
    p2p::auth::{
-      AuthCommands, AuthError, PeerId, configure_client, configure_server, generate_pairing_key,
+      AuthCommands, AuthError, configure_client, configure_server, generate_pairing_key,
       get_peer_id, handle_connecting, handle_incoming, is_known_peer, pair_peer,
    },
 };
@@ -73,8 +74,7 @@ async fn main() {
    let endpoint = setup();
    let local_addr = endpoint.local_addr().expect("failed to get local addr");
    {
-      let hex_encoded_peer_id = get_peer_id("test-peer-client").expect("failed to get peer id");
-      let peer_id = PeerId::from_str(&hex_encoded_peer_id).expect("failed to parse peer id");
+      let peer_id = get_peer_id("test-peer-client").expect("failed to get peer id");
       println!("data dir: {}", DATA_DIR.display());
       assert!(
          !is_known_peer(&peer_id).expect("failed to check peer id"),
