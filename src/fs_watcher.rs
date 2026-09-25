@@ -31,7 +31,7 @@ macro_rules! deref_impl {
 }
 
 /// Just a list of all the default ignore files supported by fsync
-const DEFAULT_IGNORE_FILES: &[&str] = &[".gitignore", ".ignore", ".fsyncignore"];
+const DEFAULT_IGNORE_FILES: &[&str] = &[".ignore", ".fsyncignore"];
 
 /// Time to wait before alerting the tree to the changes.
 ///
