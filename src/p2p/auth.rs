@@ -14,13 +14,11 @@
 //! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
-use blake3::Hash;
 use quinn::{
    Connecting, Connection, ConnectionError, Incoming, ReadError, ReadExactError, StoppedError,
    WriteError,
 };
 use std::{
-   fmt::Display,
    fs::File,
    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
    str::FromStr,
@@ -200,7 +198,7 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 /// # Errors
 ///
 /// Returns [`AuthError`] if the peer is not a known peer.
-async fn validate_peer(connection: &mut Connection, peer_id: PeerId) -> Result<()> {
+async fn validate_peer(_connection: &mut Connection, peer_id: PeerId) -> Result<()> {
    use AuthError::UnknownPeer;
    if !asyncify!(is_known_peer, &peer_id)? {
       return Err(UnknownPeer);

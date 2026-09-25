@@ -11,10 +11,7 @@
 //! [`configure_client`] skips server certificate validation entirely. Peer
 //! authenticity is instead established by the application-layer handshake in
 //! the parent `p2p_auth` module.
-use crate::{
-   DATA_DIR,
-   p2p::{HEX_ENCODED_PEER_ID_LENGTH, auth::PeerId},
-};
+use crate::{DATA_DIR, p2p::auth::PeerId};
 use quinn::{
    ClientConfig, ServerConfig,
    crypto::rustls::{QuicClientConfig, QuicServerConfig},
