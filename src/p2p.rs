@@ -1,5 +1,6 @@
 pub mod auth;
 mod close_code;
+pub mod known_peer;
 mod network;
 use auth::{configure_client, configure_server, handle_incoming};
 use blake3::Hash;
@@ -12,7 +13,8 @@ use tokio::sync::RwLock;
 use tokio::task::{self};
 use tracing::{Instrument, instrument};
 
-use crate::p2p::auth::{handle_connecting, is_known_peer};
+use crate::p2p::auth::handle_connecting;
+use crate::p2p::known_peer::{PeerId, get_known_peer};
 use crate::p2p::network::{Network, NetworkError, NetworkMember};
 use crate::{Config, asyncify};
 
@@ -24,30 +26,6 @@ pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
 /// connecting to the same peer twice
 static CONNECTED_PEERS: LazyLock<RwLock<HashSet<PeerId>>> =
    LazyLock::new(|| RwLock::new(HashSet::new()));
-
-/// A peer identity: the blake3 hash of a peer certificate's public key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-pub struct PeerId(pub [u8; 32]);
-impl From<Hash> for PeerId {
-   fn from(hash: Hash) -> Self {
-      Self(*hash.as_bytes())
-   }
-}
-impl FromStr for PeerId {
-   type Err = hex::FromHexError;
-   fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
-      let key_hash = hex::decode(line)?
-         .try_into()
-         .map_err(|_| hex::FromHexError::InvalidStringLength)?;
-      Ok(PeerId(key_hash))
-   }
-}
-
-impl Display for PeerId {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      write!(f, "{}", hex::encode(self.0))
-   }
-}
 #[instrument(skip(connection))]
 fn log_on_disconnect(connection: &Connection, peer_id: PeerId) {
    let connection = connection.clone();
@@ -69,10 +47,7 @@ fn handle_incoming_detached(incoming: Incoming) {
          return;
       };
       log_on_disconnect(&connection, peer_id);
-      #[cfg(not(debug_assertions))]
-      compile_error!(
-         "There is not current handling for incoming connections this must be implemented for production"
-      );
+      todo!("pass the connection to the sync module");
    });
 }
 
@@ -88,7 +63,7 @@ async fn network_handler<Member: NetworkMember + Send + Sync + 'static, Error: N
       .collect::<Vec<_>>();
    for member in network_members {
       let peer_id = member.id();
-      if !asyncify!(is_known_peer, &peer_id)? {
+      if !asyncify!(get_known_peer, &peer_id)?.is_some() {
          continue;
       }
       match network.connect(endpoint, member).await {
