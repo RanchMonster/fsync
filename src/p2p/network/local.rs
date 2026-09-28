@@ -96,7 +96,9 @@ type Result<T, E = EventError> = std::result::Result<T, E>;
 
 const fn is_valid_addr(addr: &ScopedIp) -> bool {
    #[cfg(not(test))]
-   return addr.is_ipv4() || addr.is_ipv6() && !addr.is_loopback();
+   // Exclude loopback so we never try to connect to the address we advertise
+   // ourselves (also excludes IPv4 loopback; note && binds tighter than ||).
+   return (addr.is_ipv4() || addr.is_ipv6()) && !addr.is_loopback();
    #[cfg(test)]
    // Easiest way to test is to allow loopback in tests only
    return addr.is_ipv4() || addr.is_ipv6();
