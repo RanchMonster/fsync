@@ -65,6 +65,13 @@ pub fn generate_pairing_key() -> Result<PairingKey, std::io::Error> {
       .truncate(true)
       .write(true)
       .open(CACHE_DIR.join("pairing_key"))?;
+   // The pairing key grants pairing access to this device, so keep the file
+   // readable only by the current user (matching the 0o600 used for cert keys).
+   #[cfg(unix)]
+   {
+      use std::os::unix::fs::PermissionsExt;
+      file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+   }
    file.write_all(&key)?;
    tokio::spawn(key_ttl_helper_task());
    Ok(PairingKey(key))
