@@ -14,6 +14,7 @@
 //! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
+use crate::p2p::known_peer::{add_known_peer, get_known_peer};
 use quinn::{
    Connecting, Connection, ConnectionError, Incoming, ReadError, ReadExactError, StoppedError,
    WriteError,
@@ -65,6 +66,8 @@ pub enum AuthError {
    PairingKeyLoadFailed(#[source] std::io::Error),
    #[error("too many pairing attempts")]
    TooManyPairingAttempts,
+   #[error("Failed to add known peer")]
+   AddKnownPeerFailed(#[source] std::io::Error),
    #[error(transparent)]
    WriteError(#[from] WriteError),
    #[error(transparent)]
@@ -90,80 +93,6 @@ impl AuthCommands {
    pub const REJECT: &[u8] = b"REJECT";
    pub const ACCEPT: &[u8] = b"ACCEPT";
    pub const PAIR: &[u8] = b"PAIR";
-}
-/// Checks whether the given key hash is present in the known peers list
-/// stored in `DATA_DIR/known_peers`. A missing file is treated as an empty
-/// list, so this returns `false` rather than panicking.
-///
-/// # Panics
-///
-/// Panics if the file exists but cannot be opened, or if more than ten
-/// lines are empty, unparseable, or unreadable.
-pub fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
-   use AuthError::KnownPeersCheckFailed;
-   use ErrorKind::NotFound;
-   let path = DATA_DIR.join("known_peers");
-   let file = match File::open(&path) {
-      Ok(file) => file,
-      Err(err) => {
-         if err.kind() == NotFound {
-            tracing::warn!(
-               known_peers_file =% path.display(),
-               error =% err,
-               "Know peers file doesn't exist"
-            );
-            return Ok(false);
-         }
-         return Err(KnownPeersCheckFailed(err));
-      }
-   };
-   let known_peers_file = BufReader::new(file);
-
-   for line in known_peers_file.lines() {
-      tracing::debug!("LINE: {line:?}");
-
-      let line = line.map_err(KnownPeersCheckFailed)?;
-
-      let stored_peer_id = PeerId::from_str(&line).expect(
-         "known peers file is corrupted please remove or reslove the issue and restart the program",
-      );
-
-      if stored_peer_id == *peer_id {
-         return Ok(true);
-      }
-   }
-
-   Ok(false)
-}
-
-/// Records the given peer in the known peers list, appending it if it is not
-/// already present.
-fn add_known_peer(peer: PeerId) -> Result<()> {
-   use AuthError::KnownPeersCheckFailed;
-   if is_known_peer(&peer)? {
-      return Ok(());
-   }
-
-   (|| {
-      let mut file = File::options()
-         .read(true)
-         .append(true)
-         .create(true)
-         .open(DATA_DIR.join("known_peers"))?;
-
-      if file.metadata()?.len() > 0 {
-         file.seek(SeekFrom::End(-1))?;
-         let mut last_char = [0];
-         file.read_exact(&mut last_char)?;
-         if last_char[0] != b'\n' {
-            file.write_all(b"\n")?;
-         }
-      }
-
-      writeln!(file, "{}", peer)?;
-      Ok(())
-   })()
-   .map_err(KnownPeersCheckFailed)
 }
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
@@ -192,6 +121,25 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
    Ok(PeerId(public_key_hash))
 }
 
+fn get_peer_cert_name(connection: &Connection) -> Option<String> {
+   let identity = connection.peer_identity()?;
+
+   let tls_handshake_data = identity
+      .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+      .ok()?;
+   let peer_cert = tls_handshake_data.first()?;
+   let (_, x509_cert) = x509_parser::parse_x509_certificate(peer_cert).ok()?;
+   Some(
+      x509_cert
+         .subject
+         .iter_common_name()
+         .next()?
+         .as_str()
+         .ok()?
+         .to_string(),
+   )
+}
+
 /// Authenticates a peer that claims to be known to us by checking its key
 /// hash against the known peers list.
 ///
@@ -199,8 +147,11 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
 ///
 /// Returns [`AuthError`] if the peer is not a known peer.
 async fn validate_peer(_connection: &mut Connection, peer_id: PeerId) -> Result<()> {
-   use AuthError::UnknownPeer;
-   if !asyncify!(is_known_peer, &peer_id)? {
+   use AuthError::{KnownPeersCheckFailed, UnknownPeer};
+   if !asyncify!(get_known_peer, &peer_id)
+      .map_err(KnownPeersCheckFailed)?
+      .is_some()
+   {
       return Err(UnknownPeer);
    }
    Ok(())
@@ -217,7 +168,7 @@ fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
 pub async fn pair_peer(
    connecting: Connecting, get_pairing_key: impl Fn() -> Option<PairingKey> + Send + Sync,
 ) -> Result<()> {
-   use AuthError::{InvalidAuthData, NoPairingKey, RejectedByPeer};
+   use AuthError::{AddKnownPeerFailed, InvalidAuthData, NoPairingKey, RejectedByPeer};
    use CloseCode::AuthenticationFailure;
    use ConnectionError::ApplicationClosed;
 
@@ -247,7 +198,9 @@ pub async fn pair_peer(
 
       if response_code == AuthCommands::ACCEPT {
          let peer_id = peer_key_hash(&connection)?;
-         asyncify!(add_known_peer, peer_id)?;
+         let peer_name = get_peer_cert_name(&connection)
+            .unwrap_or_else(|| connection.remote_address().to_string());
+         asyncify!(add_known_peer, &peer_id, &peer_name).map_err(AddKnownPeerFailed)?;
 
          return Ok(());
       }
@@ -332,7 +285,7 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> 
 /// the connection is closed with [`CloseCode::AuthenticationFailure`].
 #[instrument(skip(incoming), err)]
 pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
-   use AuthError::{InvalidAuthData, TooManyPairingAttempts};
+   use AuthError::{AddKnownPeerFailed, InvalidAuthData, TooManyPairingAttempts};
    use CloseCode::AuthenticationFailure;
    const _: () = assert!(AuthCommands::INIT.len() == AuthCommands::PAIR.len());
 
@@ -376,7 +329,9 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
 
       if let Ok(true) = validate_pair_code(pair_code) {
          let peer_id = peer_key_hash(&connection)?;
-         asyncify!(add_known_peer, peer_id)?;
+         let peer_name = get_peer_cert_name(&connection)
+            .unwrap_or_else(|| connection.remote_address().to_string());
+         asyncify!(add_known_peer, &peer_id, &peer_name).map_err(AddKnownPeerFailed)?;
 
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
          if let Err(error) = channel_tx.stopped().await {
