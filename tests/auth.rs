@@ -1,14 +1,13 @@
-use std::{
-   fs,
-   net::SocketAddr,
-   sync::OnceLock,
-};
+use std::{fs, net::SocketAddr, sync::OnceLock};
 
 use fsync::{
    DATA_DIR,
-   p2p::auth::{
-      AuthError, configure_client, configure_server, generate_pairing_key,
-      get_peer_id, handle_connecting, handle_incoming, is_known_peer, pair_peer,
+   p2p::{
+      auth::{
+         AuthError, configure_client, configure_server, generate_pairing_key, get_peer_id,
+         handle_connecting, handle_incoming, pair_peer,
+      },
+      known_peer::get_known_peer,
    },
 };
 use quinn::Endpoint;
@@ -75,7 +74,9 @@ async fn auth() {
       let peer_id = get_peer_id("test-peer-client").expect("failed to get peer id");
       println!("data dir: {}", DATA_DIR.display());
       assert!(
-         !is_known_peer(&peer_id).expect("failed to check peer id"),
+         !get_known_peer(&peer_id)
+            .expect("failed to check peer id")
+            .is_some(),
          "peer should not be known at this point"
       );
    }
