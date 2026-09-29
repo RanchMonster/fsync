@@ -276,3 +276,70 @@ async fn pair_peer_times_out_when_server_never_responds() {
       "the human-paced 30s pairing timeout should be what fired, but the exchange ended after {elapsed:?}"
    );
 }
+
+/// The client gives up after five rejected codes instead of exchanging codes
+/// with a server that never stops rejecting — the server also caps at five
+/// attempts, so there is no point continuing.
+#[tokio::test]
+async fn pair_peer_gives_up_after_five_rejected_attempts() {
+   const SERVER: &str = "rejecting-pairing-server";
+   let server = new_endpoint(SERVER, false);
+   let client = new_endpoint("rejecting-pairing-client", false);
+   let server_addr = server.local_addr().expect("failed to get local addr");
+
+   // Reads the PAIR command, then answers every pairing code with REJECT and
+   // never closes; the client must give up on its own after five attempts.
+   let rejecting = task::spawn(async move {
+      let incoming = server.accept().await.expect("no incoming connection");
+      let connection = incoming.await.expect("connection handshake failed");
+      let (mut channel_tx, mut channel_rx) = connection
+         .accept_bi()
+         .await
+         .expect("failed to accept stream");
+      let mut mode = [0u8; AuthCommands::PAIR.len()];
+      channel_rx
+         .read_exact(&mut mode)
+         .await
+         .expect("failed to read PAIR");
+      let mut code = [0u8; 64];
+      let mut seen = 0usize;
+      while seen < 5 {
+         if channel_rx.read_exact(&mut code).await.is_err() {
+            break; // the client gave up and closed the connection
+         }
+         seen += 1;
+         channel_tx
+            .write_all(AuthCommands::REJECT)
+            .await
+            .expect("failed to write REJECT");
+      }
+      // Keep the connection open until the client closes it: dropping it here
+      // would race the client's last read and fail it with quinn's implicit
+      // close (code 0, no reason) instead of letting it reach the cap.
+      connection.closed().await;
+      seen
+   });
+
+   let result = tokio::time::timeout(
+      TEST_GUARD,
+      pair_peer(connect(&client, server_addr, SERVER), || {
+         Some(PairingKey::from([42; 32]))
+      }),
+   )
+   .await
+   .expect("pair_peer hung instead of giving up after five attempts");
+
+   assert!(
+      matches!(result, Err(AuthError::TooManyPairingAttempts)),
+      "expected TooManyPairingAttempts, got {result:?}"
+   );
+
+   let codes_seen = tokio::time::timeout(TEST_GUARD, rejecting)
+      .await
+      .expect("server task hung")
+      .expect("server task panicked");
+   assert_eq!(
+      codes_seen, 5,
+      "the client must submit exactly five codes before giving up, saw {codes_seen}"
+   );
+}
