@@ -108,6 +108,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// machine steps of the handshake. The pairing key itself lives 5 minutes.
 const PAIRING_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many pairing codes a side exchanges before giving up. Both the server
+/// ([`handle_incoming`]) and the client ([`pair_peer`]) enforce this, so a
+/// misbehaving peer cannot make us exchange codes forever.
+const MAX_PAIRING_ATTEMPTS: usize = 5;
+
+/// The close reason both sides send when they run out of pairing attempts, so a
+/// rejecting peer cannot be confused with one that dropped the connection.
+const PAIRING_EXHAUSTED_REASON: &[u8] = b"Too many pairing attempts";
+
 /// Extracts the blake3 hash of the peer certificate's public key, used to
 /// identify the peer in the known peers list.
 ///
@@ -235,11 +244,29 @@ where
    with_timeout(connection, PAIRING_ATTEMPT_TIMEOUT, fut).await
 }
 
+/// Client side of the pairing exchange: submits pairing codes to a peer that
+/// asked to pair with us and accepts the connection once one is accepted.
+///
+/// Gives up after five rejected pairing codes, whether the peer keeps rejecting
+/// them or the connection is closed.
+///
+/// # Errors
+///
+/// Returns [`AuthError::TooManyPairingAttempts`] if the peer rejects five
+/// codes without closing the connection, [`AuthError::NoPairingKey`] if no
+/// pairing key is available, [`AuthError::InvalidAuthData`] if the peer
+/// answers with something other than `ACCEPT` or `REJECT`,
+/// [`AuthError::RejectedByPeer`] if the peer closes the connection with an
+/// authentication failure, [`AuthError::HandshakeTimeout`] if a step of the
+/// exchange does not complete in time, and [`AuthError`] for stream and
+/// connection failures.
 #[instrument(skip(connecting, get_pairing_key), err)]
 pub async fn pair_peer(
    connecting: Connecting, get_pairing_key: impl Fn() -> Option<PairingKey> + Send + Sync,
 ) -> Result<()> {
-   use AuthError::{AddKnownPeerFailed, InvalidAuthData, NoPairingKey, RejectedByPeer};
+   use AuthError::{
+      AddKnownPeerFailed, InvalidAuthData, NoPairingKey, RejectedByPeer, TooManyPairingAttempts,
+   };
    use CloseCode::AuthenticationFailure;
    use ConnectionError::ApplicationClosed;
 
@@ -255,11 +282,12 @@ pub async fn pair_peer(
       with_handshake_timeout(&connection, connection.open_bi()).await?;
    channel_tx.write_all(AuthCommands::PAIR).await?;
 
+   let mut connect_attempts = 0;
    let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
 
    tracing::debug!("Response code: {}", String::from_utf8_lossy(&response_code));
 
-   while connection.close_reason().is_none() {
+   while connect_attempts < MAX_PAIRING_ATTEMPTS && connection.close_reason().is_none() {
       let pair_code = get_pairing_key().ok_or(NoPairingKey)?;
 
       tracing::debug!("Attempting pairing with code: {}", pair_code);
@@ -286,11 +314,15 @@ pub async fn pair_peer(
          );
          return Err(InvalidAuthData);
       }
+      connect_attempts += 1;
    }
 
-   let close_reason = connection
-      .close_reason()
-      .expect("connection should be closed by now");
+   let Some(close_reason) = connection.close_reason() else {
+      // The server never closed (or never told us why): mirror the server's
+      // behaviour and give up after the attempt cap.
+      connection.close(AuthenticationFailure.into(), PAIRING_EXHAUSTED_REASON);
+      return Err(TooManyPairingAttempts);
+   };
 
    if let ApplicationClosed(close_packet) = &close_reason
       && close_packet.error_code == AuthenticationFailure.into()
@@ -427,7 +459,7 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    let mut connect_attempts = 0;
    let mut hex_encoded_pair_code = [0; 64];
 
-   while connect_attempts < 5 {
+   while connect_attempts < MAX_PAIRING_ATTEMPTS {
       with_pairing_timeout(
          &connection,
          channel_rx.read_exact(&mut hex_encoded_pair_code),
@@ -465,7 +497,7 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
       }
       connect_attempts += 1;
    }
-   connection.close(AuthenticationFailure.into(), b"Too many pairing attempts");
+   connection.close(AuthenticationFailure.into(), PAIRING_EXHAUSTED_REASON);
 
    Err(TooManyPairingAttempts)
 }
