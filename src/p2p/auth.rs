@@ -16,8 +16,8 @@
 //! bidirectional stream once it is established.
 use crate::p2p::known_peer::{add_known_peer, get_known_peer};
 use quinn::{
-   Connecting, Connection, ConnectionError, Incoming, ReadError, ReadExactError, StoppedError,
-   WriteError,
+   Connecting, Connection, ConnectionError, ConnectionError::ApplicationClosed, Incoming,
+   ReadError, ReadExactError, StoppedError, WriteError,
 };
 use std::{
    fs::File,
@@ -244,6 +244,21 @@ where
    with_timeout(connection, PAIRING_ATTEMPT_TIMEOUT, fut).await
 }
 
+/// If the peer rejected us, surface the rejection reason even when it only
+/// became visible on the stream-error path (a close that lands mid-read is
+/// otherwise reported as an opaque connection error). Falls back to
+/// `fallback` when the close was not an explicit rejection.
+fn surface_rejection(connection: &Connection, fallback: AuthError) -> AuthError {
+   use AuthError::RejectedByPeer;
+
+   if let Some(ApplicationClosed(close_packet)) = connection.close_reason()
+      && close_packet.error_code == CloseCode::AuthenticationFailure.into()
+   {
+      return RejectedByPeer(String::from_utf8_lossy(&close_packet.reason).into_owned());
+   }
+   fallback
+}
+
 /// Client side of the pairing exchange: submits pairing codes to a peer that
 /// asked to pair with us and accepts the connection once one is accepted.
 ///
@@ -256,8 +271,8 @@ where
 /// codes without closing the connection, [`AuthError::NoPairingKey`] if no
 /// pairing key is available, [`AuthError::InvalidAuthData`] if the peer
 /// answers with something other than `ACCEPT` or `REJECT`,
-/// [`AuthError::RejectedByPeer`] if the peer closes the connection with an
-/// authentication failure, [`AuthError::HandshakeTimeout`] if a step of the
+/// [`AuthError::RejectedByPeer`] when a rejection from the peer is observed
+/// while awaiting a response, [`AuthError::HandshakeTimeout`] if a step of the
 /// exchange does not complete in time, and [`AuthError`] for stream and
 /// connection failures.
 #[instrument(skip(connecting, get_pairing_key), err)]
@@ -268,7 +283,6 @@ pub async fn pair_peer(
       AddKnownPeerFailed, InvalidAuthData, NoPairingKey, RejectedByPeer, TooManyPairingAttempts,
    };
    use CloseCode::AuthenticationFailure;
-   use ConnectionError::ApplicationClosed;
 
    const _: () = assert!(
       AuthCommands::REJECT.len() == AuthCommands::ACCEPT.len(),
@@ -296,7 +310,11 @@ pub async fn pair_peer(
          .write_all(format!("{pair_code}").as_bytes())
          .await?;
 
-      with_pairing_timeout(&connection, channel_rx.read_exact(&mut response_code)).await?;
+      if let Err(err) =
+         with_pairing_timeout(&connection, channel_rx.read_exact(&mut response_code)).await
+      {
+         return Err(surface_rejection(&connection, err));
+      }
 
       if response_code == AuthCommands::ACCEPT {
          let peer_id = peer_key_hash(&connection)?;
@@ -328,7 +346,7 @@ pub async fn pair_peer(
       && close_packet.error_code == AuthenticationFailure.into()
    {
       return Err(RejectedByPeer(
-         String::from_utf8_lossy(&close_packet.reason).to_string(),
+         String::from_utf8_lossy(&close_packet.reason).into_owned(),
       ));
    }
 
@@ -347,9 +365,13 @@ pub async fn pair_peer(
 ///
 /// Returns [`AuthError`] if the peer is not a known peer, or if the server
 /// does not acknowledge (and close) the connection within the timeouts.
+/// Returns [`AuthError::RejectedByPeer`] with the peer's reason when the
+/// server explicitly rejects this connection by closing with an
+/// authentication-failure close code, whether that close lands mid-read or
+/// after the response has been read.
 #[instrument(skip(connecting), err)]
 pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> {
-   use AuthError::HandshakeTimeout;
+   use AuthError::{HandshakeTimeout, RejectedByPeer};
    use CloseCode::AuthenticationFailure;
 
    let mut connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
@@ -365,13 +387,24 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> 
       return Err(error);
    }
    let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
-   with_handshake_timeout(&connection, channel_rx.read_exact(&mut response_code)).await?;
+   if let Err(err) =
+      with_handshake_timeout(&connection, channel_rx.read_exact(&mut response_code)).await
+   {
+      return Err(surface_rejection(&connection, err));
+   }
 
    if response_code != AuthCommands::ACCEPT {
       // The server refused the handshake: wait (bounded) for it to close so
       // we can surface the reason, but don't let a server that refuses to
       // close pin this task indefinitely.
       return match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.closed()).await {
+         Ok(ApplicationClosed(close_packet))
+            if close_packet.error_code == AuthenticationFailure.into() =>
+         {
+            Err(RejectedByPeer(
+               String::from_utf8_lossy(&close_packet.reason).into_owned(),
+            ))
+         }
          Ok(result) => Err(result.into()),
          Err(_) => {
             connection.close(
@@ -403,9 +436,9 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> 
 /// # Errors
 ///
 /// Returns [`AuthError`] if the peer is unknown, the handshake times out,
-/// the pairing is rejected, or an invalid command is received, and
-/// [`QuicError`] for stream or connection failures. On a handshake timeout
-/// the connection is closed with [`CloseCode::Timeout`].
+/// the pairing is rejected, an invalid command is received, or a stream or
+/// connection fails. On a handshake timeout the connection is closed with
+/// [`CloseCode::Timeout`].
 #[instrument(skip(incoming), err)]
 pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    use AuthError::{AddKnownPeerFailed, HandshakeTimeout, InvalidAuthData, TooManyPairingAttempts};
@@ -422,13 +455,19 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    let (mut channel_tx, mut channel_rx) =
       with_handshake_timeout(&connection, connection.accept_bi()).await?;
    let mut mode_buf = [0u8; AuthCommands::INIT.len()];
-   with_handshake_timeout(&connection, channel_rx.read_exact(&mut mode_buf)).await?;
+   if let Err(err) = with_handshake_timeout(&connection, channel_rx.read_exact(&mut mode_buf)).await
+   {
+      return Err(surface_rejection(&connection, err));
+   }
 
    tracing::debug!("Mode: {}", String::from_utf8_lossy(&mode_buf));
    let peer_id = peer_key_hash(&connection)?;
    if mode_buf == AuthCommands::INIT {
       if let Err(error) = validate_peer(&mut connection, peer_id).await {
-         channel_tx.write_all(AuthCommands::REJECT).await?;
+         // The peer may already be closing; the rejection close packet carries
+         // the reason either way, so never let a best-effort REJECT mask the
+         // real error.
+         let _ = channel_tx.write_all(AuthCommands::REJECT).await;
          connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
          return Err(error);
       }
@@ -460,11 +499,14 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    let mut hex_encoded_pair_code = [0; 64];
 
    while connect_attempts < MAX_PAIRING_ATTEMPTS {
-      with_pairing_timeout(
+      if let Err(err) = with_pairing_timeout(
          &connection,
          channel_rx.read_exact(&mut hex_encoded_pair_code),
       )
-      .await?;
+      .await
+      {
+         return Err(surface_rejection(&connection, err));
+      }
 
       let pair_code = str::from_utf8(&hex_encoded_pair_code)
          .map_err(|_| InvalidAuthData)?

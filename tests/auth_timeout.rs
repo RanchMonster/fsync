@@ -343,3 +343,177 @@ async fn pair_peer_gives_up_after_five_rejected_attempts() {
       "the client must submit exactly five codes before giving up, saw {codes_seen}"
    );
 }
+
+/// A rejection that arrives while the client is blocked mid-read must surface
+/// as `RejectedByPeer`, not as an opaque connection error: the server never
+/// answers, so the close is only ever visible on the stream-error path.
+#[tokio::test]
+async fn pair_peer_surfaces_rejection_that_arrives_mid_read() {
+   const SERVER: &str = "rejecting-mid-read-server";
+   // The wire value of `CloseCode::AuthenticationFailure`. The enum itself is
+   // crate private, so it is spelled out here.
+   const AUTH_FAILURE_CODE: u32 = 5;
+   let server = new_endpoint(SERVER, false);
+   let client = new_endpoint("rejecting-mid-read-client", false);
+   let server_addr = server.local_addr().expect("failed to get local addr");
+
+   // Reads the PAIR command and then closes with an authentication failure
+   // without writing a response, so the client's read is still blocked when
+   // the close lands.
+   let rejecting = task::spawn(async move {
+      let incoming = server.accept().await.expect("no incoming connection");
+      let connection = incoming.await.expect("connection handshake failed");
+      let (_tx, mut rx) = connection
+         .accept_bi()
+         .await
+         .expect("failed to accept stream");
+      let mut mode = [0u8; AuthCommands::PAIR.len()];
+      rx.read_exact(&mut mode).await.expect("failed to read PAIR");
+      connection.close(VarInt::from_u32(AUTH_FAILURE_CODE), b"nope");
+      connection.closed().await
+   });
+
+   let result = tokio::time::timeout(
+      TEST_GUARD,
+      pair_peer(connect(&client, server_addr, SERVER), || {
+         Some(PairingKey::from([42; 32]))
+      }),
+   )
+   .await
+   .expect("pair_peer hung instead of surfacing the rejection");
+
+   match result {
+      Err(AuthError::RejectedByPeer(reason)) => assert_eq!(reason, "nope"),
+      other => panic!("expected RejectedByPeer(\"nope\"), got {other:?}"),
+   }
+
+   tokio::time::timeout(TEST_GUARD, rejecting)
+      .await
+      .expect("server task hung")
+      .expect("server task panicked");
+}
+
+/// A server that rejects an `INIT` must surface as `RejectedByPeer`, not as an
+/// opaque connection error. The `REJECT` response is flushed before the close,
+/// so the client reads a non-`ACCEPT` response and the rejection surfaces
+/// through the bounded wait for the peer's close.
+#[tokio::test]
+async fn handle_connecting_surfaces_peer_rejection() {
+   const SERVER: &str = "rejecting-connecting-server";
+   // The wire value of `CloseCode::AuthenticationFailure`. The enum itself is
+   // crate private, so it is spelled out here.
+   const AUTH_FAILURE_CODE: u32 = 5;
+   const REASON: &str = "peer is not a known peer";
+   let server = new_endpoint(SERVER, false);
+   let client = new_endpoint("rejecting-connecting-client", false);
+   let server_addr = server.local_addr().expect("failed to get local addr");
+   // `handle_connecting` checks the *server* against its own known peers before
+   // it reads the response, so the server has to be trusted for the client to
+   // reach the read the rejection lands on.
+   trust_peer(SERVER);
+
+   // Reads the INIT datagram, then rejects and closes with an authentication
+   // failure, giving the REJECT response time to reach the client first.
+   let rejecting = task::spawn(async move {
+      let incoming = server.accept().await.expect("no incoming connection");
+      let connection = incoming.await.expect("connection handshake failed");
+      let (mut channel_tx, mut channel_rx) = connection
+         .accept_bi()
+         .await
+         .expect("failed to accept stream");
+      let mut mode = [0u8; AuthCommands::INIT.len()];
+      channel_rx
+         .read_exact(&mut mode)
+         .await
+         .expect("failed to read INIT");
+      let _ = channel_tx.write_all(AuthCommands::REJECT).await;
+      // Yield so the REJECT is flushed before we close: the client must observe
+      // the REJECT on the stream and take the bounded closed() path below, not
+      // exit at the mid-read guard (which would leave that arm untested).
+      tokio::time::sleep(Duration::from_millis(250)).await;
+      connection.close(VarInt::from_u32(AUTH_FAILURE_CODE), REASON.as_bytes());
+      connection.closed().await
+   });
+
+   let result = tokio::time::timeout(
+      TEST_GUARD,
+      handle_connecting(connect(&client, server_addr, SERVER)),
+   )
+   .await
+   .expect("handle_connecting hung instead of surfacing the rejection");
+
+   match result {
+      Err(AuthError::RejectedByPeer(reason)) => assert_eq!(reason, REASON),
+      other => panic!("expected RejectedByPeer({REASON:?}), got {other:?}"),
+   }
+
+   // The rejection close is the server's own, so the server observes it as
+   // LocallyClosed. This records intent rather than guarding a regression: the
+   // server's `close` sets that state synchronously, so a client-side close
+   // could not land first and this assertion cannot tell the two apart.
+   match tokio::time::timeout(TEST_GUARD, rejecting)
+      .await
+      .expect("server task hung")
+      .expect("server task panicked")
+   {
+      ConnectionError::LocallyClosed => {}
+      other => panic!("expected the server's own close to end the connection, got {other:?}"),
+   }
+}
+
+/// The mirror image on the server side: a client that closes with an
+/// authentication failure while `handle_incoming` is blocked reading a pairing
+/// code must surface as `RejectedByPeer`, not as an opaque connection error.
+#[tokio::test]
+async fn handle_incoming_surfaces_pairing_rejection_that_arrives_mid_read() {
+   const SERVER: &str = "rejecting-pair-code-server";
+   // The wire value of `CloseCode::AuthenticationFailure`. The enum itself is
+   // crate private, so it is spelled out here.
+   const AUTH_FAILURE_CODE: u32 = 5;
+   const REASON: &str = "this pairing request is rejected";
+   let server = new_endpoint(SERVER, false);
+   let client = new_endpoint("rejecting-pair-code-client", false);
+   let server_addr = server.local_addr().expect("failed to get local addr");
+
+   // Accepting and dialing must run concurrently: `server.accept()` only
+   // yields an `Incoming` once a client contacts the server.
+   let handling = task::spawn(async move {
+      let incoming = server.accept().await.expect("no incoming connection");
+      handle_incoming(incoming).await
+   });
+
+   let connection = tokio::time::timeout(TEST_GUARD, connect(&client, server_addr, SERVER))
+      .await
+      .expect("the client connection hung")
+      .expect("connection handshake failed");
+   let (mut channel_tx, _channel_rx) = tokio::time::timeout(TEST_GUARD, connection.open_bi())
+      .await
+      .expect("the client never opened the handshake stream")
+      .expect("failed to open the handshake stream");
+   // A well formed code, but the test data dir has no pairing key cached, so
+   // the server cannot accept it. The client never answers: it closes instead.
+   let pair_code = PairingKey::from([42; 32]).to_string();
+   tokio::time::timeout(TEST_GUARD, channel_tx.write_all(AuthCommands::PAIR))
+      .await
+      .expect("failed to send PAIR")
+      .expect("failed to send PAIR");
+   tokio::time::timeout(TEST_GUARD, channel_tx.write_all(pair_code.as_bytes()))
+      .await
+      .expect("failed to send the pair code")
+      .expect("failed to send the pair code");
+   // `close` drops the queued stream data, so the PAIR command has to be given
+   // time to reach the server: what is under test here is the pair-code read
+   // that follows the mode read, not the mode read itself.
+   tokio::time::sleep(Duration::from_millis(250)).await;
+   connection.close(VarInt::from_u32(AUTH_FAILURE_CODE), REASON.as_bytes());
+
+   let result = tokio::time::timeout(TEST_GUARD, handling)
+      .await
+      .expect("handle_incoming hung instead of surfacing the rejection")
+      .expect("handle_incoming task panicked");
+
+   match result {
+      Err(AuthError::RejectedByPeer(reason)) => assert_eq!(reason, REASON),
+      other => panic!("expected RejectedByPeer({REASON:?}), got {other:?}"),
+   }
+}
