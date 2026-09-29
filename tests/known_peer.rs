@@ -83,3 +83,51 @@ fn get_known_peer_returns_none_for_an_unlisted_peer() {
       "adding a peer should not stop it being found"
    );
 }
+
+/// A name that tries to inject a second, well-formed entry must not be able to
+/// break the one-peer-per-line format: the stored name is neutralized and the
+/// smuggled id never becomes a known peer.
+#[test]
+fn add_known_peer_does_not_allow_injecting_a_second_entry() {
+   let real_id = unique_peer_id(0x61);
+   let attacker_id = unique_peer_id(0x62);
+   let malformed_name = format!("alice\n{}\tattacker", attacker_id);
+
+   add_known_peer(&real_id, &malformed_name).unwrap();
+
+   let peer_info = get_known_peer(&real_id)
+      .unwrap()
+      .expect("the real peer should be known");
+   assert_eq!(peer_info.peer_id, real_id);
+   assert_eq!(
+      peer_info.name,
+      format!("alice {} attacker", attacker_id),
+      "a stored name must keep the hostile newline neutralized, got {:?}",
+      peer_info.name
+   );
+
+   // The file is shared with the other tests in this binary, so this checks the
+   // lines belonging to the ids involved rather than the total line count: one
+   // line starts with the real id, and none start with the attacker id.
+   let contents = fs::read_to_string(known_peers_file_path()).unwrap();
+   let real_prefix = real_id.to_string();
+   let attacker_prefix = attacker_id.to_string();
+   let lines: Vec<&str> = contents.lines().collect();
+
+   assert_eq!(
+      lines
+         .iter()
+         .filter(|line| line.starts_with(&real_prefix))
+         .count(),
+      1,
+      "exactly one line may start with the real id"
+   );
+   assert!(
+      !lines.iter().any(|line| line.starts_with(&attacker_prefix)),
+      "no line may start with the attacker id"
+   );
+   assert!(
+      get_known_peer(&attacker_id).unwrap().is_none(),
+      "a peer smuggled through a name must not become known"
+   );
+}

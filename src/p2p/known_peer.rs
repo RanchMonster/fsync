@@ -13,6 +13,8 @@ use std::{fmt::Display, str::FromStr, sync::RwLock};
 use crate::DATA_DIR;
 
 pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
+/// Maximum length of a peer name stored in the known peers file (in chars).
+const MAX_PEER_NAME_LENGTH: usize = 255;
 
 static KNOWN_PEERS_LOCK: RwLock<()> = RwLock::new(());
 /// Where the known peers list is stored. Also handles creating the file if it
@@ -53,11 +55,17 @@ pub struct PeerInfo {
    pub peer_id: PeerId,
 }
 
-fn split_peer_id_and_name(line: &str) -> (&str, &str) {
-   assert!(line.len() >= HEX_ENCODED_PEER_ID_LENGTH);
-   let encoded_peer_id = &line[..HEX_ENCODED_PEER_ID_LENGTH];
-   let name = line[HEX_ENCODED_PEER_ID_LENGTH..].trim();
-   (encoded_peer_id, name)
+/// Splits a known-peers line into its first 64 bytes (the hex-encoded id) and
+/// the remainder (the name, trimmed). The id does not have to be followed by a
+/// tab: any line of at least 64 bytes that is not cut through a multi-byte
+/// character at that offset parses, and whatever follows the id — separator or
+/// not — is the name. Returns `None` for shorter lines and for lines whose byte
+/// 64 falls inside a character, both of which make the line unparseable and a
+/// candidate for repair.
+fn split_peer_id_and_name(line: &str) -> Option<(&str, &str)> {
+   let encoded_peer_id = line.get(..HEX_ENCODED_PEER_ID_LENGTH)?;
+   let name = line.get(HEX_ENCODED_PEER_ID_LENGTH..)?.trim();
+   Some((encoded_peer_id, name))
 }
 
 #[cfg(unix)]
@@ -88,6 +96,11 @@ fn ensure_known_peers_file() -> Result<()> {
    }
 }
 
+/// Rewrites the file, dropping unparseable and duplicate entries and re-sanitizing
+/// names. This scrubs control characters *within* names, but it cannot undo a line
+/// split that an older version already committed to disk: an injected entry is
+/// indistinguishable from a legitimate one once written. Only the write-path
+/// sanitizer prevents that going forward.
 fn clean_known_peers_file() -> Result<()> {
    let _write_guard = KNOWN_PEERS_LOCK
       .write()
@@ -104,10 +117,9 @@ fn clean_known_peers_file() -> Result<()> {
    let mut already_known_peers = HashSet::new();
    for line in old_known_peers_file.lines() {
       let line = line?;
-      if line.len() < HEX_ENCODED_PEER_ID_LENGTH {
+      let Some((peer_id, name)) = split_peer_id_and_name(&line) else {
          continue;
-      }
-      let (peer_id, _) = split_peer_id_and_name(&line);
+      };
       let Ok(peer_id) = PeerId::from_str(peer_id) else {
          continue;
       };
@@ -115,7 +127,12 @@ fn clean_known_peers_file() -> Result<()> {
          continue;
       }
 
-      writeln!(new_known_peers_file, "{}", line)?;
+      writeln!(
+         new_known_peers_file,
+         "{}\t{}",
+         peer_id,
+         sanitize_peer_name(name)
+      )?;
    }
    new_known_peers_file.flush()?;
 
@@ -153,12 +170,10 @@ pub fn get_known_peer(peer_id: &PeerId) -> Result<Option<PeerInfo>> {
       let mut needs_cleaning = false;
       for line in known_peers_file.lines() {
          let line = line?;
-         if line.len() < HEX_ENCODED_PEER_ID_LENGTH {
+         let Some((peer_id_str, name)) = split_peer_id_and_name(&line) else {
             needs_cleaning = true;
             break;
-         }
-
-         let (peer_id_str, name) = split_peer_id_and_name(&line);
+         };
          let Ok(stored_peer_id) = PeerId::from_str(peer_id_str) else {
             needs_cleaning = true;
             break;
@@ -167,7 +182,7 @@ pub fn get_known_peer(peer_id: &PeerId) -> Result<Option<PeerInfo>> {
          if stored_peer_id == *peer_id {
             drop(read_guard);
             return Ok(Some(PeerInfo {
-               name: name.to_string(),
+               name: sanitize_peer_name(name),
                peer_id: *peer_id,
             }));
          }
@@ -186,8 +201,28 @@ pub fn get_known_peer(peer_id: &PeerId) -> Result<Option<PeerInfo>> {
    ))
 }
 
+/// Sanitizes a peer name for storage in the known peers file.
+///
+/// Names come from a peer's (self-signed) certificate, so they must not be
+/// able to break the one-peer-per-line format of the file: control characters
+/// (notably newlines and tabs) are replaced with spaces, whitespace is
+/// trimmed, and the length is capped.
+fn sanitize_peer_name(name: &str) -> String {
+   let mut sanitized =
+      String::with_capacity(name.len().min(MAX_PEER_NAME_LENGTH * char::MAX.len_utf8()));
+   for c in name.chars().take(MAX_PEER_NAME_LENGTH) {
+      if c.is_control() {
+         sanitized.push(' ');
+      } else {
+         sanitized.push(c);
+      }
+   }
+   sanitized.trim().to_string()
+}
+
 pub fn add_known_peer(peer_id: &PeerId, name: &str) -> Result<()> {
    use SeekFrom::End;
+   let name = sanitize_peer_name(name);
    ensure_known_peers_file()?;
 
    let mut _write_guard = KNOWN_PEERS_LOCK
@@ -223,7 +258,7 @@ mod tests {
    #[test]
    fn test_split_peer_id_and_name() {
       let line = format!("{}\t{}", EMPTY_PEER_ID, TEST_PEER_NAME);
-      let (peer_id, name) = split_peer_id_and_name(&line);
+      let (peer_id, name) = split_peer_id_and_name(&line).expect("valid line");
 
       assert_eq!(PeerId::from_str(peer_id).unwrap(), EMPTY_PEER_ID);
       assert_eq!(name, "test");
@@ -231,15 +266,65 @@ mod tests {
    #[test]
    fn test_split_peer_id_and_name_empty_name() {
       let line = EMPTY_PEER_ID.to_string();
-      let (peer_id, name) = split_peer_id_and_name(&line);
+      let (peer_id, name) = split_peer_id_and_name(&line).expect("valid line");
 
       assert_eq!(PeerId::from_str(peer_id).unwrap(), EMPTY_PEER_ID);
       assert_eq!(name, "");
    }
 
    #[test]
-   #[should_panic]
    fn test_split_bad_line() {
-      split_peer_id_and_name("bad line");
+      assert!(split_peer_id_and_name("bad line").is_none());
+   }
+
+   /// Byte 64 falls inside the `é`, so the line must be reported as
+   /// unparseable instead of panicking on a `&str` slice.
+   #[test]
+   fn test_split_line_where_byte_64_is_inside_a_char() {
+      let line = format!("{}é{}", "a".repeat(63), "b");
+      assert_eq!(line.len(), 66);
+      assert!(split_peer_id_and_name(&line).is_none());
+   }
+
+   /// Byte 64 landing exactly on a char boundary of a multi-byte name is
+   /// still a valid line, and the name must survive intact.
+   #[test]
+   fn test_split_multibyte_name_at_the_boundary() {
+      let line = format!("{}\té", EMPTY_PEER_ID);
+      let (peer_id, name) = split_peer_id_and_name(&line).expect("valid line");
+
+      assert_eq!(PeerId::from_str(peer_id).unwrap(), EMPTY_PEER_ID);
+      assert_eq!(name, "é");
+   }
+
+   #[test]
+   fn test_sanitize_peer_name() {
+      assert_eq!(sanitize_peer_name("test"), "test");
+      assert_eq!(sanitize_peer_name("bad\nname"), "bad name");
+      assert_eq!(sanitize_peer_name("bad\tname"), "bad name");
+      assert_eq!(sanitize_peer_name("bad\rname"), "bad name");
+      assert_eq!(sanitize_peer_name("  trim  "), "trim");
+   }
+
+   #[test]
+   fn test_sanitize_peer_name_all_control_chars() {
+      assert_eq!(sanitize_peer_name("\n\t\r"), "");
+   }
+
+   #[test]
+   fn test_sanitize_peer_name_truncates() {
+      let name = sanitize_peer_name(&"a".repeat(300));
+      assert_eq!(name.chars().count(), MAX_PEER_NAME_LENGTH);
+   }
+
+   #[test]
+   fn test_sanitize_peer_name_nul() {
+      assert_eq!(sanitize_peer_name("a\0b"), "a b");
+   }
+
+   /// The cap counts chars, not bytes, so multi-byte names are not mangled.
+   #[test]
+   fn test_sanitize_peer_name_keeps_multibyte_chars() {
+      assert_eq!(sanitize_peer_name("日本\n語"), "日本 語");
    }
 }
