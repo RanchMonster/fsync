@@ -8,6 +8,8 @@ pub enum CloseCode {
    InternalError = 3,
    Shutdown = 4,
    AuthenticationFailure = 5,
+   // Handshake or pairing step took too long.
+   Timeout = 6,
    // add more as needed
 }
 impl From<CloseCode> for VarInt {

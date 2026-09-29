@@ -23,6 +23,7 @@ use std::{
    fs::File,
    io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
    str::FromStr,
+   time::Duration,
 };
 use thiserror::Error;
 use tracing::instrument;
@@ -58,6 +59,8 @@ pub enum AuthError {
    RejectedByPeer(String),
    #[error("invalid auth handshake data")]
    InvalidAuthData,
+   #[error("handshake timed out")]
+   HandshakeTimeout,
    #[error("invalid pairing key: {0}")]
    InvalidPairingKey(#[source] hex::FromHexError),
    #[error("no pairing key")]
@@ -94,6 +97,16 @@ impl AuthCommands {
    pub const ACCEPT: &[u8] = b"ACCEPT";
    pub const PAIR: &[u8] = b"PAIR";
 }
+
+/// How long we wait for any single step of the auth handshake before giving
+/// up. A peer that connects but never sends data must not be able to hold a
+/// task (and a connection slot) indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The pairing exchange is human-paced (the user must read the code off one
+/// device and type it into the other), so allow much more time than the
+/// machine steps of the handshake. The pairing key itself lives 5 minutes.
+const PAIRING_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
 /// identify the peer in the known peers list.
@@ -164,6 +177,64 @@ fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
    Ok(false)
 }
 
+/// Runs a pre-authentication handshake step under a deadline, closing the
+/// connection with [`CloseCode::Timeout`] if the step runs out of time.
+///
+/// This is the shared core of [`with_handshake_timeout`] and
+/// [`with_pairing_timeout`]; it closes the connection because every step it
+/// is used for happens *before* the peer is authenticated, so an
+/// unresponsive peer must be dropped rather than kept around. It must not be
+/// used for anything that happens after a handshake has succeeded.
+async fn with_timeout<E, T>(
+   connection: &Connection, timeout: Duration,
+   fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   match tokio::time::timeout(timeout, fut).await {
+      Ok(result) => result.map_err(Into::into),
+      Err(_) => {
+         connection.close(
+            CloseCode::Timeout.into(),
+            AuthError::HandshakeTimeout.to_string().as_bytes(),
+         );
+         Err(AuthError::HandshakeTimeout)
+      }
+   }
+}
+
+/// Runs a machine-paced pre-authentication handshake step under
+/// [`HANDSHAKE_TIMEOUT`], closing the connection with [`CloseCode::Timeout`]
+/// if the step times out.
+///
+/// Only for steps a peer is expected to answer immediately; anything
+/// human-paced must use [`with_pairing_timeout`] instead.
+async fn with_handshake_timeout<E, T>(
+   connection: &Connection, fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   with_timeout(connection, HANDSHAKE_TIMEOUT, fut).await
+}
+
+/// Runs a human-paced pre-authentication step under
+/// [`PAIRING_ATTEMPT_TIMEOUT`], closing the connection with
+/// [`CloseCode::Timeout`] if the step times out.
+///
+/// Only for the pairing exchange, where the user has to read the code off one
+/// device and type it into the other; it still closes the connection because
+/// no peer has been authenticated at that point.
+async fn with_pairing_timeout<E, T>(
+   connection: &Connection, fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   with_timeout(connection, PAIRING_ATTEMPT_TIMEOUT, fut).await
+}
+
 #[instrument(skip(connecting, get_pairing_key), err)]
 pub async fn pair_peer(
    connecting: Connecting, get_pairing_key: impl Fn() -> Option<PairingKey> + Send + Sync,
@@ -177,8 +248,11 @@ pub async fn pair_peer(
       "Reject and Accept codes must be the same length"
    );
 
-   let connection = connecting.await?;
-   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+      .await
+      .map_err(|_| AuthError::HandshakeTimeout)??;
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.open_bi()).await?;
    channel_tx.write_all(AuthCommands::PAIR).await?;
 
    let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
@@ -194,7 +268,7 @@ pub async fn pair_peer(
          .write_all(format!("{pair_code}").as_bytes())
          .await?;
 
-      channel_rx.read_exact(&mut response_code).await?;
+      with_pairing_timeout(&connection, channel_rx.read_exact(&mut response_code)).await?;
 
       if response_code == AuthCommands::ACCEPT {
          let peer_id = peer_key_hash(&connection)?;
@@ -234,18 +308,23 @@ pub async fn pair_peer(
 ///
 /// Sends an `INIT` datagram, checks that this peer is in the known peers
 /// list, then waits up to five seconds for the server's `ACKNOWLEDGE`
-/// datagram.
+/// datagram. If the server answers with anything else we wait up to five more
+/// seconds for it to close the connection, to surface the reason it gave.
 ///
 /// # Errors
 ///
-/// Returns [`AuthError`] if the peer is not a known peer or the server does
-/// not acknowledge the connection within the timeout.
+/// Returns [`AuthError`] if the peer is not a known peer, or if the server
+/// does not acknowledge (and close) the connection within the timeouts.
 #[instrument(skip(connecting), err)]
 pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> {
+   use AuthError::HandshakeTimeout;
    use CloseCode::AuthenticationFailure;
 
-   let mut connection = connecting.await?;
-   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
+   let mut connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+      .await
+      .map_err(|_| HandshakeTimeout)??;
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.open_bi()).await?;
 
    channel_tx.write_all(AuthCommands::INIT).await?;
    let peer_id = peer_key_hash(&connection)?;
@@ -254,10 +333,22 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> 
       return Err(error);
    }
    let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
-   channel_rx.read_exact(&mut response_code).await?;
+   with_handshake_timeout(&connection, channel_rx.read_exact(&mut response_code)).await?;
 
    if response_code != AuthCommands::ACCEPT {
-      return Err(connection.closed().await.into());
+      // The server refused the handshake: wait (bounded) for it to close so
+      // we can surface the reason, but don't let a server that refuses to
+      // close pin this task indefinitely.
+      return match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.closed()).await {
+         Ok(result) => Err(result.into()),
+         Err(_) => {
+            connection.close(
+               CloseCode::Timeout.into(),
+               AuthError::HandshakeTimeout.to_string().as_bytes(),
+            );
+            Err(AuthError::HandshakeTimeout)
+         }
+      };
    }
 
    Ok((connection, peer_id))
@@ -282,17 +373,24 @@ pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> 
 /// Returns [`AuthError`] if the peer is unknown, the handshake times out,
 /// the pairing is rejected, or an invalid command is received, and
 /// [`QuicError`] for stream or connection failures. On a handshake timeout
-/// the connection is closed with [`CloseCode::AuthenticationFailure`].
+/// the connection is closed with [`CloseCode::Timeout`].
 #[instrument(skip(incoming), err)]
 pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
-   use AuthError::{AddKnownPeerFailed, InvalidAuthData, TooManyPairingAttempts};
+   use AuthError::{AddKnownPeerFailed, HandshakeTimeout, InvalidAuthData, TooManyPairingAttempts};
    use CloseCode::AuthenticationFailure;
    const _: () = assert!(AuthCommands::INIT.len() == AuthCommands::PAIR.len());
 
-   let mut connection = incoming.await?;
-   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+   let mut connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+      Ok(Ok(connection)) => connection,
+      Ok(Err(err)) => return Err(err.into()),
+      Err(_) => return Err(HandshakeTimeout),
+   };
+   // No connection object exists before `incoming` resolves, so the first
+   // timeout above can't close the connection; the rest can.
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.accept_bi()).await?;
    let mut mode_buf = [0u8; AuthCommands::INIT.len()];
-   channel_rx.read_exact(&mut mode_buf).await?;
+   with_handshake_timeout(&connection, channel_rx.read_exact(&mut mode_buf)).await?;
 
    tracing::debug!("Mode: {}", String::from_utf8_lossy(&mode_buf));
    let peer_id = peer_key_hash(&connection)?;
@@ -304,7 +402,19 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
       }
 
       channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      channel_tx.stopped().await?;
+      // Wait for the client to finish the handshake stream, but don't let a
+      // stalled client pin this task: on timeout keep the (now authenticated)
+      // connection alive.
+      match tokio::time::timeout(HANDSHAKE_TIMEOUT, channel_tx.stopped()).await {
+         Ok(result) => {
+            if let Err(error) = result {
+               tracing::warn!("peer stopped the handshake stream unexpectedly: {error}");
+            }
+         }
+         Err(_) => {
+            tracing::debug!("handshake stream was not stopped within the timeout");
+         }
+      }
       return Ok((connection, peer_id));
    }
 
@@ -318,7 +428,11 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
    let mut hex_encoded_pair_code = [0; 64];
 
    while connect_attempts < 5 {
-      channel_rx.read_exact(&mut hex_encoded_pair_code).await?;
+      with_pairing_timeout(
+         &connection,
+         channel_rx.read_exact(&mut hex_encoded_pair_code),
+      )
+      .await?;
 
       let pair_code = str::from_utf8(&hex_encoded_pair_code)
          .map_err(|_| InvalidAuthData)?
@@ -334,8 +448,18 @@ pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
          asyncify!(add_known_peer, &peer_id, &peer_name).map_err(AddKnownPeerFailed)?;
 
          channel_tx.write_all(AuthCommands::ACCEPT).await?;
-         if let Err(error) = channel_tx.stopped().await {
-            connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
+         // Wait for the client to finish the handshake stream, but don't let a
+         // stalled client pin this task: on timeout keep the (now
+         // authenticated) connection alive.
+         match tokio::time::timeout(HANDSHAKE_TIMEOUT, channel_tx.stopped()).await {
+            Ok(result) => {
+               if let Err(error) = result {
+                  tracing::warn!("peer stopped the handshake stream unexpectedly: {error}");
+               }
+            }
+            Err(_) => {
+               tracing::debug!("handshake stream was not stopped within the timeout");
+            }
          }
          return Ok((connection, peer_id));
       }
