@@ -20,9 +20,7 @@ use quinn::{
    ReadError, ReadExactError, StoppedError, WriteError,
 };
 use std::{
-   fs::File,
-   io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
-   str::FromStr,
+   io::{Read, Write},
    time::Duration,
 };
 use thiserror::Error;
@@ -30,7 +28,7 @@ use tracing::instrument;
 
 use super::close_code::CloseCode;
 use crate::{
-   DATA_DIR, asyncify,
+   asyncify,
    p2p::{PeerId, auth::pairing_key::load_pairing_key},
 };
 
