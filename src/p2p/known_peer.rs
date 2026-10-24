@@ -1,14 +1,13 @@
 use blake3::Hash;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{
-   BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Result, Seek, SeekFrom, Write,
-};
+use std::io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 use std::{fmt::Display, str::FromStr, sync::RwLock};
+use thiserror::Error;
 
 use crate::DATA_DIR;
 
@@ -16,7 +15,20 @@ pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
 /// Maximum length of a peer name stored in the known peers file (in chars).
 const MAX_PEER_NAME_LENGTH: usize = 255;
 
+const MAX_FILE_REPAIR_ATTEMPTS: usize = 10;
+
 static KNOWN_PEERS_LOCK: RwLock<()> = RwLock::new(());
+#[derive(Error, Debug)]
+enum KnownPeersError {
+   #[error("Failed to check known peers file: {0}")]
+   IoError(#[from] std::io::Error),
+   #[error("Failed to parse peer id from known peers file: {0}")]
+   FromHexError(hex::FromHexError),
+   #[error("Failed to repair known peers file after {MAX_FILE_REPAIR_ATTEMPTS} attempts")]
+   FailedToRepairFile,
+}
+
+type Result<T> = std::result::Result<T, KnownPeersError>;
 /// Where the known peers list is stored. Also handles creating the file if it
 /// does not exist yet.
 pub fn known_peers_file_path() -> PathBuf {
@@ -74,7 +86,7 @@ fn harden_known_peers_file_permissions() -> Result<()> {
    let known_peers_file_path = known_peers_file_path();
    let mut permissions = fs::metadata(&known_peers_file_path)?.permissions();
    permissions.set_mode(0o600);
-   fs::set_permissions(&known_peers_file_path, permissions)
+   fs::set_permissions(&known_peers_file_path, permissions).map_err(KnownPeersError::IoError)
 }
 
 #[cfg(not(unix))]
@@ -92,7 +104,7 @@ fn ensure_known_peers_file() -> Result<()> {
    {
       Ok(_) => harden_known_peers_file_permissions(),
       Err(err) if err.kind() == ErrorKind::AlreadyExists => Ok(()),
-      Err(err) => Err(err),
+      Err(err) => Err(err.into()),
    }
 }
 
@@ -158,8 +170,8 @@ fn lazy_clean_file() -> Result<()> {
 }
 
 pub fn get_known_peer(peer_id: &PeerId) -> Result<Option<PeerInfo>> {
-   const MAX_ATTEMPTS: usize = 10;
-   for _ in 0..MAX_ATTEMPTS {
+   use KnownPeersError::FailedToRepairFile;
+   for _ in 0..MAX_FILE_REPAIR_ATTEMPTS {
       ensure_known_peers_file()?;
       let known_peers_file = BufReader::new(File::open(known_peers_file_path())?);
 
@@ -194,11 +206,7 @@ pub fn get_known_peer(peer_id: &PeerId) -> Result<Option<PeerInfo>> {
       }
       lazy_clean_file()?;
    }
-
-   Err(Error::new(
-      ErrorKind::InvalidData,
-      format!("known peers file is still malformed after {MAX_ATTEMPTS} repair attempts"),
-   ))
+   Err(FailedToRepairFile)
 }
 
 /// Sanitizes a peer name for storage in the known peers file.
