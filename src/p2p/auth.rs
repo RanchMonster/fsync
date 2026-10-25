@@ -14,39 +14,33 @@
 //! [`authenticate_client_side`] and [`initiate_pairing`] are the client entry
 //! points; [`pair_peer`] runs the shared pairing exchange over a
 //! bidirectional stream once it is established.
-use argon2::{Argon2, PasswordVerifier, password_hash::PasswordHashString};
-use hex::FromHexError;
-use quinn::{Connection, Incoming, RecvStream, Side};
-use rand::random;
+use crate::p2p::known_peer::{add_known_peer, get_known_peer};
+use quinn::{
+   Connecting, Connection, ConnectionError, ConnectionError::ApplicationClosed, Incoming,
+   ReadError, ReadExactError, StoppedError, WriteError,
+};
 use std::{
-   fmt::Display,
-   fs::File,
-   io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write},
-   str::FromStr,
-   sync::Arc,
+   io::{Read, Write},
    time::Duration,
 };
 use thiserror::Error;
-use tokio::{
-   task::{self, JoinError},
-   time::timeout,
-};
 use tracing::instrument;
-use x509_parser::nom::AsBytes;
 
-use super::error::CloseCode;
-use crate::{CONFIG_DIR, p2p::error::QuicError};
+use super::close_code::CloseCode;
+use crate::{
+   asyncify,
+   p2p::{PeerId, auth::pairing_key::load_pairing_key},
+};
 
 #[cfg(test)]
 pub(crate) static KNOWN_PEERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub mod mtls;
+mod pairing_key;
 /// Re-exports the mTLS server and client config builders from the `mtls`
 /// submodule.
 pub use mtls::{configure_client, configure_server, get_peer_id};
-
-const MAX_PASSWORD_ATTEMPTS: u32 = 5;
-const MAX_PASSWORD_LENGTH: usize = 256;
+pub use pairing_key::{PairingKey, generate_pairing_key};
 
 /// Errors that can occur during peer authentication and pairing.
 #[derive(Error, Debug)]
@@ -59,45 +53,35 @@ pub enum AuthError {
    KnownPeersCheckFailed(#[source] std::io::Error),
    #[error("peer is not a known peer")]
    UnknownPeer,
-   #[error("Received invalid pairing mode from peer")]
-   InvalidPairMode,
-   #[error("failed to verify password")]
-   PasswordVerificationFailure(#[source] JoinError),
-   #[error("Key only mode does not allow pairing")]
-   PairingNotAllowed,
-   #[error("Password must be at least 1 character long")]
-   EmptyPassword,
-   #[error("Password rejected")]
-   PasswordRejected,
-   #[error("Key mismatch")]
-   KeyMismatch,
-   #[error("failed to register peer: {0}")]
-   FailedToRegisterPeer(#[source] std::io::Error),
-   #[error("peer connection timed out")]
-   PeerTimeout,
-   #[error("handshake timed out")]
-   HandshakeTimeout,
+   #[error("rejected by peer due to {0}")]
+   RejectedByPeer(String),
    #[error("invalid auth handshake data")]
    InvalidAuthData,
-   #[error("Too many password attempts")]
-   TooManyPasswordAttempts,
-   #[error("Too many pairing key attempts")]
-   TooManyKeyAttempts,
+   #[error("handshake timed out")]
+   HandshakeTimeout,
    #[error("invalid pairing key: {0}")]
    InvalidPairingKey(#[source] hex::FromHexError),
+   #[error("no pairing key")]
+   NoPairingKey,
+   #[error("failed to load pairing key")]
+   PairingKeyLoadFailed(#[source] std::io::Error),
+   #[error("too many pairing attempts")]
+   TooManyPairingAttempts,
+   #[error("Failed to add known peer")]
+   AddKnownPeerFailed(#[source] std::io::Error),
    #[error(transparent)]
-   Quic(QuicError),
+   WriteError(#[from] WriteError),
+   #[error(transparent)]
+   ReadError(#[from] ReadError),
+   #[error(transparent)]
+   ReadExactError(#[from] ReadExactError),
+   #[error(transparent)]
+   ConnectionError(#[from] ConnectionError),
+   #[error(transparent)]
+   StoppedError(#[from] StoppedError),
 }
 
-/// Simple wrapper to handle for all QUIC errors.
-impl<T> From<T> for AuthError
-where
-   T: Into<QuicError>,
-{
-   fn from(err: T) -> Self {
-      Self::Quic(err.into())
-   }
-}
+pub type ValidatedPeer = (Connection, PeerId);
 /// Define the result type for this module.
 type Result<T, E = AuthError> = std::result::Result<T, E>;
 
@@ -107,153 +91,29 @@ type Result<T, E = AuthError> = std::result::Result<T, E>;
 pub struct AuthCommands;
 impl AuthCommands {
    pub const INIT: &[u8] = b"INIT";
-   pub const ACKNOWLEDGE: &[u8] = b"ACKNOWLEDGE";
-   pub const HOLD: &[u8] = b"HOLD";
    pub const REJECT: &[u8] = b"REJECT";
    pub const ACCEPT: &[u8] = b"ACCEPT";
    pub const PAIR: &[u8] = b"PAIR";
 }
 
-/// A peer identity: the blake3 hash of a peer certificate's public key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
-pub struct PeerId(pub [u8; 32]);
+/// How long we wait for any single step of the auth handshake before giving
+/// up. A peer that connects but never sends data must not be able to hold a
+/// task (and a connection slot) indefinitely.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-impl FromStr for PeerId {
-   type Err = hex::FromHexError;
-   fn from_str(line: &str) -> std::result::Result<Self, Self::Err> {
-      let key_hash = hex::decode(line)?
-         .try_into()
-         .map_err(|_| hex::FromHexError::InvalidStringLength)?;
-      Ok(PeerId(key_hash))
-   }
-}
+/// The pairing exchange is human-paced (the user must read the code off one
+/// device and type it into the other), so allow much more time than the
+/// machine steps of the handshake. The pairing key itself lives 5 minutes.
+const PAIRING_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl Display for PeerId {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      write!(f, "{}", hex::encode(self.0))
-   }
-}
+/// How many pairing codes a side exchanges before giving up. Both the server
+/// ([`handle_incoming`]) and the client ([`pair_peer`]) enforce this, so a
+/// misbehaving peer cannot make us exchange codes forever.
+const MAX_PAIRING_ATTEMPTS: usize = 5;
 
-/// Checks whether the given key hash is present in the known peers list
-/// stored in `CONFIG_DIR/known_peers`. A missing file is treated as an empty
-/// list, so this returns `false` rather than panicking.
-///
-/// # Panics
-///
-/// Panics if the file exists but cannot be opened, or if more than ten
-/// lines are empty, unparseable, or unreadable.
-pub async fn is_known_peer(peer_id: &PeerId) -> Result<bool> {
-   use AuthError::KnownPeersCheckFailed;
-   fn sync_check_logic(connecting_peer_id: PeerId) -> Result<bool> {
-      use ErrorKind::NotFound;
-      let path = CONFIG_DIR.join("known_peers");
-      let file = match File::open(&path) {
-         Ok(file) => file,
-         Err(err) => {
-            if err.kind() == NotFound {
-               tracing::warn!(
-                  known_peers_file =% path.display(),
-                  error =% err,
-                  "Know peers file doesn't exist"
-               );
-               return Ok(false);
-            }
-            return Err(KnownPeersCheckFailed(err));
-         }
-      };
-      let known_peers_file = BufReader::new(file);
-      for line in known_peers_file.lines() {
-         let line = line.map_err(KnownPeersCheckFailed)?;
-
-         // I decide to simplify this to just print a warning and move on for now.
-         // I decided to do something else here I want to allow the program to keep running but also
-         // don't allow the corrupted file to continue to exist.
-         let Ok(stored_peer_id) = PeerId::from_str(&line) else {
-            #[cfg(debug_assertions)]
-            {
-               tracing::warn!(bad_line=%line,known_peers_file_path=%path.display(),"The known peers file is corupted");
-               continue;
-            }
-            #[cfg(not(debug_assertions))]
-            todo!("Find a better way to handle invalid file state");
-         };
-         if stored_peer_id == connecting_peer_id {
-            return Ok(true);
-         }
-      }
-      Ok(false)
-   }
-
-   let peer_id = *peer_id;
-   task::spawn_blocking(move || sync_check_logic(peer_id))
-      .await
-      .expect("Thread paniced unexpectedly while attempting to check known peer file")
-}
-
-/// Represents the pairing mode of this device: how the server side handles a
-/// `PAIR` request from an unknown peer. The `Display` form of the mode is what
-/// is announced to the pairing client over the wire. The default is
-/// [`PairMode::Relaxed`].
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum PairMode {
-   /// Strict mode: a random key is generated and announced, and the other
-   /// device must enter it to complete the pairing.
-   Strict,
-   /// Relaxed mode: other devices can connect without any confirmation from
-   /// this device.
-   #[default]
-   Relaxed,
-   /// Password mode: other devices can connect to this device by providing
-   /// the password whose hash is stored in this variant.
-   Password(Arc<PasswordHashString>),
-   /// Key only mode: pairing is not allowed; users must manually copy the
-   /// public key to both devices instead.
-   KeyOnly,
-   // Add other modes here as needed
-}
-impl Display for PairMode {
-   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-      match self {
-         PairMode::Strict => write!(f, "STRICT"),
-         PairMode::Relaxed => write!(f, "RELAXED"),
-         PairMode::Password(_) => write!(f, "PASSWORD"),
-         PairMode::KeyOnly => write!(f, "KEYONLY"),
-      }
-   }
-}
-
-/// Records the given peer in the known peers list, appending it if it is not
-/// already present.
-async fn add_known_peer(peer: PeerId) -> Result<()> {
-   use AuthError::KnownPeersCheckFailed;
-
-   fn sync_inner(peer: PeerId) -> Result<(), std::io::Error> {
-      let mut file = File::options()
-         .read(true)
-         .append(true)
-         .create(true)
-         .open(CONFIG_DIR.join("known_peers"))?;
-      if file.metadata()?.len() > 0 {
-         file.seek(SeekFrom::End(-1))?;
-         let mut last_char = [0];
-         file.read_exact(&mut last_char)?;
-         if last_char[0] != b'\n' {
-            file.write_all(b"\n")?;
-         }
-      }
-      writeln!(file, "{}", peer)?;
-      Ok(())
-   }
-
-   if is_known_peer(&peer).await? {
-      return Ok(());
-   }
-   task::spawn_blocking(move || sync_inner(peer))
-      .await
-      .expect("Thread unexpectedly panicked")
-      .map_err(KnownPeersCheckFailed)
-}
+/// The close reason both sides send when they run out of pairing attempts, so a
+/// rejecting peer cannot be confused with one that dropped the connection.
+const PAIRING_EXHAUSTED_REASON: &[u8] = b"Too many pairing attempts";
 
 /// Extracts the blake3 hash of the peer certificate's public key, used to
 /// identify the peer in the known peers list.
@@ -281,269 +141,214 @@ fn peer_key_hash(connection: &Connection) -> Result<PeerId> {
    Ok(PeerId(public_key_hash))
 }
 
+fn get_peer_cert_name(connection: &Connection) -> Option<String> {
+   let identity = connection.peer_identity()?;
+
+   let tls_handshake_data = identity
+      .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+      .ok()?;
+   let peer_cert = tls_handshake_data.first()?;
+   let (_, x509_cert) = x509_parser::parse_x509_certificate(peer_cert).ok()?;
+   Some(
+      x509_cert
+         .subject
+         .iter_common_name()
+         .next()?
+         .as_str()
+         .ok()?
+         .to_string(),
+   )
+}
+
 /// Authenticates a peer that claims to be known to us by checking its key
 /// hash against the known peers list.
 ///
 /// # Errors
 ///
 /// Returns [`AuthError`] if the peer is not a known peer.
-pub async fn authenticate_peer(connection: &mut Connection) -> Result<()> {
-   use AuthError::UnknownPeer;
-   let peer_id = peer_key_hash(connection)?;
-   if !is_known_peer(&peer_id).await? {
+async fn validate_peer(_connection: &mut Connection, peer_id: PeerId) -> Result<()> {
+   use AuthError::{KnownPeersCheckFailed, UnknownPeer};
+   if !asyncify!(get_known_peer, &peer_id)
+      .map_err(KnownPeersCheckFailed)?
+      .is_some()
+   {
       return Err(UnknownPeer);
    }
    Ok(())
 }
 
-/// Prompts the user for input on stdin, returning the trimmed line.
-///
-/// # Errors
-///
-/// Returns [`std::io::Error`] if writing the prompt or reading the input fails.
-async fn prompt_user(prompt: &'static str) -> Result<String, std::io::Error> {
-   fn sync_inner(prompt: &str) -> Result<String, std::io::Error> {
-      use std::io::{stdin, stdout};
-      let mut stdout = stdout();
-      stdout.write_all(prompt.as_bytes())?;
-      stdout.flush()?;
-      let mut line = String::new();
-      stdin().read_line(&mut line)?;
-      Ok(line.trim().to_string())
+fn validate_pair_code(pair_code: PairingKey) -> Result<bool> {
+   if let Some(pairing_key) = load_pairing_key()? {
+      return Ok(pairing_key == pair_code);
    }
-   task::spawn_blocking(|| sync_inner(prompt))
-      .await
-      .expect("Thread unexpectedly panicked")
+   Ok(false)
 }
 
-/// Client side of the pairing exchange: reads the pair mode announced by the
-/// server and provides the requested credentials. The peer is recorded as
-/// known on the server side of the exchange, not here.
+/// Runs a pre-authentication handshake step under a deadline, closing the
+/// connection with [`CloseCode::Timeout`] if the step runs out of time.
+///
+/// This is the shared core of [`with_handshake_timeout`] and
+/// [`with_pairing_timeout`]; it closes the connection because every step it
+/// is used for happens *before* the peer is authenticated, so an
+/// unresponsive peer must be dropped rather than kept around. It must not be
+/// used for anything that happens after a handshake has succeeded.
+async fn with_timeout<E, T>(
+   connection: &Connection, timeout: Duration,
+   fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   match tokio::time::timeout(timeout, fut).await {
+      Ok(result) => result.map_err(Into::into),
+      Err(_) => {
+         connection.close(
+            CloseCode::Timeout.into(),
+            AuthError::HandshakeTimeout.to_string().as_bytes(),
+         );
+         Err(AuthError::HandshakeTimeout)
+      }
+   }
+}
+
+/// Runs a machine-paced pre-authentication handshake step under
+/// [`HANDSHAKE_TIMEOUT`], closing the connection with [`CloseCode::Timeout`]
+/// if the step times out.
+///
+/// Only for steps a peer is expected to answer immediately; anything
+/// human-paced must use [`with_pairing_timeout`] instead.
+async fn with_handshake_timeout<E, T>(
+   connection: &Connection, fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   with_timeout(connection, HANDSHAKE_TIMEOUT, fut).await
+}
+
+/// Runs a human-paced pre-authentication step under
+/// [`PAIRING_ATTEMPT_TIMEOUT`], closing the connection with
+/// [`CloseCode::Timeout`] if the step times out.
+///
+/// Only for the pairing exchange, where the user has to read the code off one
+/// device and type it into the other; it still closes the connection because
+/// no peer has been authenticated at that point.
+async fn with_pairing_timeout<E, T>(
+   connection: &Connection, fut: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+   E: Into<AuthError>,
+{
+   with_timeout(connection, PAIRING_ATTEMPT_TIMEOUT, fut).await
+}
+
+/// If the peer rejected us, surface the rejection reason even when it only
+/// became visible on the stream-error path (a close that lands mid-read is
+/// otherwise reported as an opaque connection error). Falls back to
+/// `fallback` when the close was not an explicit rejection.
+fn surface_rejection(connection: &Connection, fallback: AuthError) -> AuthError {
+   use AuthError::RejectedByPeer;
+
+   if let Some(ApplicationClosed(close_packet)) = connection.close_reason()
+      && close_packet.error_code == CloseCode::AuthenticationFailure.into()
+   {
+      return RejectedByPeer(String::from_utf8_lossy(&close_packet.reason).into_owned());
+   }
+   fallback
+}
+
+/// Client side of the pairing exchange: submits pairing codes to a peer that
+/// asked to pair with us and accepts the connection once one is accepted.
+///
+/// Gives up after five rejected pairing codes, whether the peer keeps rejecting
+/// them or the connection is closed.
 ///
 /// # Errors
 ///
-/// Returns [`AuthError`] if the pairing key or password is rejected, the
-/// input is invalid, or the maximum number of attempts is exceeded, and
-/// [`QuicError`] if the pairing stream fails.
-///
-/// # Panics
-///
-/// Panics if the server announces an unknown pair mode, or if reading input
-/// from the user fails.
-async fn pair_client_side(connection: &mut Connection) -> Result<()> {
+/// Returns [`AuthError::TooManyPairingAttempts`] if the peer rejects five
+/// codes without closing the connection, [`AuthError::NoPairingKey`] if no
+/// pairing key is available, [`AuthError::InvalidAuthData`] if the peer
+/// answers with something other than `ACCEPT` or `REJECT`,
+/// [`AuthError::RejectedByPeer`] when a rejection from the peer is observed
+/// while awaiting a response, [`AuthError::HandshakeTimeout`] if a step of the
+/// exchange does not complete in time, and [`AuthError`] for stream and
+/// connection failures.
+#[instrument(skip(connecting, get_pairing_key), err)]
+pub async fn pair_peer(
+   connecting: Connecting, get_pairing_key: impl Fn() -> Option<PairingKey> + Send + Sync,
+) -> Result<()> {
    use AuthError::{
-      InvalidPairMode, InvalidPairingKey, TooManyKeyAttempts, TooManyPasswordAttempts,
+      AddKnownPeerFailed, InvalidAuthData, NoPairingKey, RejectedByPeer, TooManyPairingAttempts,
    };
-   assert_eq!(
-      AuthCommands::ACCEPT.len(),
-      AuthCommands::REJECT.len(),
-      "the pairing response must both be the same length"
+   use CloseCode::AuthenticationFailure;
+
+   const _: () = assert!(
+      AuthCommands::REJECT.len() == AuthCommands::ACCEPT.len(),
+      "Reject and Accept codes must be the same length"
    );
 
-   async fn accepted(channel_rx: &mut RecvStream) -> Result<bool> {
-      let mut response_buf = [0u8; AuthCommands::ACCEPT.len()];
-      let Ok(result) = timeout(
-         Duration::from_secs(5),
-         channel_rx.read_exact(&mut response_buf),
-      )
+   let connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
       .await
-      else {
-         tracing::warn!("Timed out waiting for pairing response");
-         return Ok(false);
-      };
-      result?;
-      Ok(response_buf == AuthCommands::ACCEPT)
-   }
-   /// Helper function to simplify the decoding of the pairing key
-   fn decoed_pairing_key(key: &str) -> Result<[u8; 8], FromHexError> {
-      let key_hex = hex::decode(key)?
-         .try_into()
-         .map_err(|_| FromHexError::InvalidStringLength)?;
-      Ok(key_hex)
-   }
-   let (mut channel_tx, mut channel_rx) = connection.accept_bi().await?;
+      .map_err(|_| AuthError::HandshakeTimeout)??;
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.open_bi()).await?;
+   channel_tx.write_all(AuthCommands::PAIR).await?;
 
-   let mut mode_len = [0; 1];
-   channel_rx.read_exact(&mut mode_len).await?;
-   let mut mode_buf = vec![0; mode_len[0] as usize];
-   channel_rx.read_exact(&mut mode_buf).await?;
-   let mode_str = std::str::from_utf8(&mode_buf).map_err(|_| InvalidPairMode)?;
-   match mode_str {
-      "RELAXED" => {}
+   let mut connect_attempts = 0;
+   let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
 
-      "PASSWORD" => {
-         let mut password_attempts = 0;
-         loop {
-            if password_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyPasswordAttempts);
-            }
-            let password = prompt_user("Password: ")
-               .await
-               // I am still expecting this because there are only two reasons this _could_ fail
-               // 1. stdin is not readable
-               // 2. the read data is not valid utf8/utf16
-               .expect("Failed to read password input");
-            if password.is_empty() || password.len() > 256 {
-               // I am not using tracing here because that is for logging this is for user feedback
-               eprintln!("Password must be between 1 and 256 characters long");
-               password_attempts += 1;
-               continue;
-            }
-            channel_tx.write_all(password.as_bytes()).await?;
-            if accepted(&mut channel_rx).await? {
-               break;
-            }
-            password_attempts += 1;
-         }
+   tracing::debug!("Response code: {}", String::from_utf8_lossy(&response_code));
+
+   while connect_attempts < MAX_PAIRING_ATTEMPTS && connection.close_reason().is_none() {
+      let pair_code = get_pairing_key().ok_or(NoPairingKey)?;
+
+      tracing::debug!("Attempting pairing with code: {}", pair_code);
+
+      channel_tx
+         .write_all(format!("{pair_code}").as_bytes())
+         .await?;
+
+      if let Err(err) =
+         with_pairing_timeout(&connection, channel_rx.read_exact(&mut response_code)).await
+      {
+         return Err(surface_rejection(&connection, err));
       }
 
-      "STRICT" => {
-         let mut key_attempts = 0;
-         loop {
-            if key_attempts >= MAX_PASSWORD_ATTEMPTS {
-               return Err(TooManyKeyAttempts);
-            }
-            let key_hex = prompt_user("Enter the pairing key: ")
-               .await
-               // Same as password prompt
-               .expect("Failed to read pairing key input")
-               .chars()
-               .filter(|c| *c != '-')
-               .collect::<String>();
-            let key = decoed_pairing_key(&key_hex).map_err(InvalidPairingKey)?;
-            channel_tx.write_all(&key).await?;
-            if accepted(&mut channel_rx).await? {
-               break;
-            }
-            key_attempts += 1;
-         }
+      if response_code == AuthCommands::ACCEPT {
+         let peer_id = peer_key_hash(&connection)?;
+         let peer_name = get_peer_cert_name(&connection)
+            .unwrap_or_else(|| connection.remote_address().to_string());
+         asyncify!(add_known_peer, &peer_id, &peer_name).map_err(AddKnownPeerFailed)?;
+
+         return Ok(());
       }
 
-      "KEYONLY" => {}
-
-      _ => return Err(InvalidPairMode),
-   }
-
-   Ok(())
-}
-
-/// Server side of the pairing exchange: announces the configured pair mode,
-/// validates the client's response, and records the peer as known on success.
-///
-/// # Errors
-///
-/// Returns [`AuthError`] if the pairing is rejected, and [`QuicError`] for
-/// stream or connection failures.
-async fn pair_server_side(connection: &mut Connection, pair_mode: &PairMode) -> Result<()> {
-   use AuthError::{
-      EmptyPassword, KeyMismatch, PairingNotAllowed, PasswordRejected, PasswordVerificationFailure,
-   };
-   use PairMode::*;
-   let (mut channel_tx, mut channel_rx) = connection.open_bi().await?;
-   let mode = pair_mode.to_string();
-   let mode_len = u8::try_from(mode.len()).expect("pair mode string is too long");
-   channel_tx.write_all(&[mode_len]).await?;
-   channel_tx.write_all(mode.as_bytes()).await?;
-   match pair_mode {
-      Relaxed => {
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      }
-
-      KeyOnly => {
-         channel_tx.write_all(AuthCommands::REJECT).await?;
-         return Err(PairingNotAllowed);
-      }
-
-      Password(password) => {
-         let password = password.clone();
-         let mut client_password = [0u8; 256]; // any password longer than this is rejected
-         let read = channel_rx
-            .read(&mut client_password)
-            .await?
-            .unwrap_or_default();
-         if read == 0 {
-            return Err(EmptyPassword);
-         }
-
-         let client_password = client_password[..read].to_vec();
-         let verifier = Argon2::default();
-         let accept = task::spawn_blocking(move || {
-            verifier
-               .verify_password(&client_password, &password.password_hash())
-               .is_ok()
-         })
-         .await
-         .map_err(PasswordVerificationFailure)?;
-         if !accept {
-            channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(PasswordRejected);
-         }
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
-      }
-      Strict => {
-         let random_key = random::<[u8; 8]>();
-         let as_hex_string = random_key.map(|byte| format!("{byte:02X}")).join("-");
-         tracing::info!("Generated random key for device: {as_hex_string}");
-         assert!(
-            as_hex_string.len() == 23,
-            "Generated key must be 23 characters long when encoded with dashes"
+      if response_code != AuthCommands::REJECT {
+         connection.close(
+            AuthenticationFailure.into(),
+            InvalidAuthData.to_string().as_bytes(),
          );
-         let mut response_key = [0; 8];
-         channel_rx.read_exact(&mut response_key).await?;
-         if random_key != response_key {
-            channel_tx.write_all(AuthCommands::REJECT).await?;
-            return Err(KeyMismatch);
-         }
-         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+         return Err(InvalidAuthData);
       }
+      connect_attempts += 1;
    }
-   let peer_id = peer_key_hash(connection)?;
-   add_known_peer(peer_id).await?;
-   Ok(())
-}
 
-/// Runs the pairing handshake over an established QUIC connection.
-///
-/// The exchange is driven by the connection's role: the client side reads the
-/// pair mode announced by the server and supplies the requested credentials,
-/// while the server side announces its configured [`PairMode`] and validates
-/// the client's response. The server records the peer in the known peers list
-/// when the pairing succeeds.
-///
-/// # Arguments
-///
-/// * `connection` - the established QUIC connection to the peer.
-/// * `pair_mode` - the mode used on the server side of the exchange. It is
-///   required (this function panics if it is `None` on the server side) and
-///   is ignored on the client side.
-///
-/// # Errors
-///
-/// On the server side, returns [`AuthError`] when the pairing is rejected
-/// (for example `KeyOnly` mode, a password or key mismatch, or failing to
-/// record the peer) and [`QuicError`] for stream or connection failures.
-///
-/// On the client side the exchange's errors are not propagated; this function
-/// always returns `Ok`.
-///
-/// # Panics
-///
-/// Panics if the server side is used without a [`PairMode`].
-pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>) -> Result<()> {
-   use Side::{Client, Server};
-   match connection.side() {
-      Client => {
-         pair_client_side(connection).await;
-         Ok(())
-      }
-      Server => {
-         pair_server_side(
-            connection,
-            pair_mode.expect("server side pairing requires a pair mode"),
-         )
-         .await
-      }
+   let Some(close_reason) = connection.close_reason() else {
+      // The server never closed (or never told us why): mirror the server's
+      // behaviour and give up after the attempt cap.
+      connection.close(AuthenticationFailure.into(), PAIRING_EXHAUSTED_REASON);
+      return Err(TooManyPairingAttempts);
+   };
+
+   if let ApplicationClosed(close_packet) = &close_reason
+      && close_packet.error_code == AuthenticationFailure.into()
+   {
+      return Err(RejectedByPeer(
+         String::from_utf8_lossy(&close_packet.reason).into_owned(),
+      ));
    }
+
+   Err(close_reason.into())
 }
 
 /// Client side of the authenticated handshake: announces that we are a known
@@ -551,41 +356,65 @@ pub async fn pair_peer(connection: &mut Connection, pair_mode: Option<&PairMode>
 ///
 /// Sends an `INIT` datagram, checks that this peer is in the known peers
 /// list, then waits up to five seconds for the server's `ACKNOWLEDGE`
-/// datagram.
+/// datagram. If the server answers with anything else we wait up to five more
+/// seconds for it to close the connection, to surface the reason it gave.
 ///
 /// # Errors
 ///
-/// Returns [`AuthError`] if the peer is not a known peer or the server does
-/// not acknowledge the connection within the timeout.
-pub async fn authenticate_client_side(connection: &mut Connection) -> Result<()> {
-   use AuthError::{InvalidAuthData, PeerTimeout};
-   connection.send_datagram(AuthCommands::INIT.into())?;
-   authenticate_peer(connection).await?;
-   match timeout(Duration::from_secs(5), connection.read_datagram()).await {
-      Ok(Ok(data)) => {
-         if data.starts_with(AuthCommands::ACKNOWLEDGE) {
-            Ok(())
-         } else {
-            Err(InvalidAuthData)
-         }
-      }
-      _ => Err(PeerTimeout),
-   }
-}
+/// Returns [`AuthError`] if the peer is not a known peer, or if the server
+/// does not acknowledge (and close) the connection within the timeouts.
+/// Returns [`AuthError::RejectedByPeer`] with the peer's reason when the
+/// server explicitly rejects this connection by closing with an
+/// authentication-failure close code, whether that close lands mid-read or
+/// after the response has been read.
+#[instrument(skip(connecting), err)]
+pub async fn handle_connecting(connecting: Connecting) -> Result<ValidatedPeer> {
+   use AuthError::{HandshakeTimeout, RejectedByPeer};
+   use CloseCode::AuthenticationFailure;
 
-/// Client side of the pairing handshake: announces a pairing request and runs
-/// the exchange with the server.
-///
-/// Sends a `PAIR` datagram, then delegates the rest of the exchange to
-/// [`pair_peer`].
-///
-/// # Errors
-///
-/// Returns [`QuicError`] if the `PAIR` datagram cannot be sent, or
-/// [`AuthError`] if the pairing exchange fails on the client side.
-pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
-   connection.send_datagram(AuthCommands::PAIR.into())?;
-   pair_peer(connection, None).await
+   let mut connection = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
+      .await
+      .map_err(|_| HandshakeTimeout)??;
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.open_bi()).await?;
+
+   channel_tx.write_all(AuthCommands::INIT).await?;
+   let peer_id = peer_key_hash(&connection)?;
+   if let Err(error) = validate_peer(&mut connection, peer_id).await {
+      connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
+      return Err(error);
+   }
+   let mut response_code = [0u8; AuthCommands::ACCEPT.len()];
+   if let Err(err) =
+      with_handshake_timeout(&connection, channel_rx.read_exact(&mut response_code)).await
+   {
+      return Err(surface_rejection(&connection, err));
+   }
+
+   if response_code != AuthCommands::ACCEPT {
+      // The server refused the handshake: wait (bounded) for it to close so
+      // we can surface the reason, but don't let a server that refuses to
+      // close pin this task indefinitely.
+      return match tokio::time::timeout(HANDSHAKE_TIMEOUT, connection.closed()).await {
+         Ok(ApplicationClosed(close_packet))
+            if close_packet.error_code == AuthenticationFailure.into() =>
+         {
+            Err(RejectedByPeer(
+               String::from_utf8_lossy(&close_packet.reason).into_owned(),
+            ))
+         }
+         Ok(result) => Err(result.into()),
+         Err(_) => {
+            connection.close(
+               CloseCode::Timeout.into(),
+               AuthError::HandshakeTimeout.to_string().as_bytes(),
+            );
+            Err(AuthError::HandshakeTimeout)
+         }
+      };
+   }
+
+   Ok((connection, peer_id))
 }
 
 /// Server side of the handshake: accepts an incoming QUIC connection and
@@ -605,154 +434,110 @@ pub async fn initiate_pairing(connection: &mut Connection) -> Result<()> {
 /// # Errors
 ///
 /// Returns [`AuthError`] if the peer is unknown, the handshake times out,
-/// the pairing is rejected, or an invalid command is received, and
-/// [`QuicError`] for stream or connection failures. On a handshake timeout
-/// the connection is closed with [`CloseCode::AuthenticationFailure`].
-#[instrument(skip(incoming, pair_mode))] // pair_mode doesn't matter here
-pub async fn handle_incoming(incoming: Incoming, pair_mode: &PairMode) -> Result<Connection> {
-   use AuthError::{HandshakeTimeout, InvalidAuthData};
+/// the pairing is rejected, an invalid command is received, or a stream or
+/// connection fails. On a handshake timeout the connection is closed with
+/// [`CloseCode::Timeout`].
+#[instrument(skip(incoming), err)]
+pub async fn handle_incoming(incoming: Incoming) -> Result<ValidatedPeer> {
+   use AuthError::{AddKnownPeerFailed, HandshakeTimeout, InvalidAuthData, TooManyPairingAttempts};
    use CloseCode::AuthenticationFailure;
-   let mut connection = incoming.await?;
-   let handshake_packet = match timeout(Duration::from_secs(5), connection.read_datagram()).await {
-      Ok(Ok(data)) => data,
-      Ok(Err(err)) => {
-         return Err(err.into());
-      }
-      Err(_) => {
-         let err = HandshakeTimeout;
-         connection.close(AuthenticationFailure.into(), err.to_string().as_bytes());
-         return Err(err);
-      }
+   const _: () = assert!(AuthCommands::INIT.len() == AuthCommands::PAIR.len());
+
+   let mut connection = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+      Ok(Ok(connection)) => connection,
+      Ok(Err(err)) => return Err(err.into()),
+      Err(_) => return Err(HandshakeTimeout),
    };
-   if handshake_packet.starts_with(AuthCommands::INIT) {
-      authenticate_peer(&mut connection).await?;
-      connection.send_datagram(AuthCommands::ACKNOWLEDGE.into())?;
-      Ok(connection)
-   } else if handshake_packet.starts_with(AuthCommands::PAIR) {
-      pair_peer(&mut connection, Some(pair_mode)).await?;
-      Ok(connection)
-   } else {
-      Err(InvalidAuthData)
-   }
-}
-
-#[cfg(test)]
-mod tests {
-   use super::*;
-   use quinn::{Connecting, Incoming};
-   use tokio::task::JoinSet;
-
-   const TEST_SOCKET_ADDR: &str = "127.0.0.1:0"; // use localhost to avoid firewall issues
-
-   #[test]
-   fn test_known_peer_comparison() {
-      let random_key = random::<[u8; 32]>();
-      let peer = PeerId(random_key);
-      let hexed_key = hex::encode(random_key);
-      let prased_key = PeerId::from_str(&hexed_key).expect("failed to parse known peer");
-      assert_eq!(peer, prased_key);
+   // No connection object exists before `incoming` resolves, so the first
+   // timeout above can't close the connection; the rest can.
+   let (mut channel_tx, mut channel_rx) =
+      with_handshake_timeout(&connection, connection.accept_bi()).await?;
+   let mut mode_buf = [0u8; AuthCommands::INIT.len()];
+   if let Err(err) = with_handshake_timeout(&connection, channel_rx.read_exact(&mut mode_buf)).await
+   {
+      return Err(surface_rejection(&connection, err));
    }
 
-   #[tokio::test]
-   async fn test_is_known_peers_found() {
-      let _guard = KNOWN_PEERS_LOCK
-         .lock()
-         .unwrap_or_else(|poisoned| poisoned.into_inner());
-      let known_key = PeerId(random::<[u8; 32]>());
-      let other_key = PeerId(random::<[u8; 32]>());
-      let path = CONFIG_DIR.join("known_peers");
-      let contents = format!(
-         "{}\n\n{}\n{}\n",
-         other_key, "not-a-valid-hex-line", known_key,
-      );
-      std::fs::write(&path, contents).expect("failed to write known peers file");
-      assert!(
-         is_known_peer(&known_key)
-            .await
-            .expect("Failed to check if peer was known"),
-         "Test Peer id {known_key} was not found"
-      );
-      assert!(
-         is_known_peer(&other_key)
-            .await
-            .expect("Failed to check if peer was known"),
-         "Test Peer id {other_key} was not found"
-      );
-      let bad_peer_id = PeerId(random::<[u8; 32]>());
-      // I am dumb but I feel like there should be a better way to say that asset message
-      assert!(
-         !is_known_peer(&bad_peer_id)
-            .await
-            .expect("Failed to check if peer was known"),
-         "Test Peer id {bad_peer_id} was marked as valid when it should have been marked as invalid"
-      );
-      let _ = std::fs::remove_file(&path);
+   tracing::debug!("Mode: {}", String::from_utf8_lossy(&mode_buf));
+   let peer_id = peer_key_hash(&connection)?;
+   if mode_buf == AuthCommands::INIT {
+      if let Err(error) = validate_peer(&mut connection, peer_id).await {
+         // The peer may already be closing; the rejection close packet carries
+         // the reason either way, so never let a best-effort REJECT mask the
+         // real error.
+         let _ = channel_tx.write_all(AuthCommands::REJECT).await;
+         connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
+         return Err(error);
+      }
+
+      channel_tx.write_all(AuthCommands::ACCEPT).await?;
+      // Wait for the client to finish the handshake stream, but don't let a
+      // stalled client pin this task: on timeout keep the (now authenticated)
+      // connection alive.
+      match tokio::time::timeout(HANDSHAKE_TIMEOUT, channel_tx.stopped()).await {
+         Ok(result) => {
+            if let Err(error) = result {
+               tracing::warn!("peer stopped the handshake stream unexpectedly: {error}");
+            }
+         }
+         Err(_) => {
+            tracing::debug!("handshake stream was not stopped within the timeout");
+         }
+      }
+      return Ok((connection, peer_id));
    }
 
-   #[tokio::test]
-   async fn test_is_known_peers_missing_file() {
-      let _guard = KNOWN_PEERS_LOCK
-         .lock()
-         .unwrap_or_else(|poisoned| poisoned.into_inner());
+   if mode_buf != AuthCommands::PAIR {
+      let error = InvalidAuthData;
+      connection.close(AuthenticationFailure.into(), error.to_string().as_bytes());
+      return Err(error);
+   }
 
-      let _ = std::fs::remove_file(CONFIG_DIR.join("known_peers"));
-      let peer_id = PeerId(random::<[u8; 32]>());
+   let mut connect_attempts = 0;
+   let mut hex_encoded_pair_code = [0; 64];
 
-      assert!(
-         !is_known_peer(&peer_id)
-            .await
-            .expect("Failed to check if peer was known"),
-         "Test Peer id {peer_id} was marked as valid when it should have been marked as invalid"
+   while connect_attempts < MAX_PAIRING_ATTEMPTS {
+      if let Err(err) = with_pairing_timeout(
+         &connection,
+         channel_rx.read_exact(&mut hex_encoded_pair_code),
       )
-   }
+      .await
+      {
+         return Err(surface_rejection(&connection, err));
+      }
 
-   async fn connecting_peer(connect_attempt: Connecting) {
-      let mut connection = connect_attempt.await.expect("failed to connect");
-      // send pairing request
-      connection
-         .send_datagram(AuthCommands::PAIR.into())
-         .expect("failed to send pairing request");
-      pair_peer(&mut connection, None)
-         .await
-         .expect("failed to pair peer");
-   }
+      let pair_code = str::from_utf8(&hex_encoded_pair_code)
+         .map_err(|_| InvalidAuthData)?
+         .parse::<PairingKey>()
+         .map_err(|_| InvalidAuthData)?;
 
-   async fn responding_peer(incoming: Incoming, pair_mode: PairMode) {
-      handle_incoming(incoming, &pair_mode)
-         .await
-         .expect("failed to handle incoming connection");
-   }
+      tracing::debug!("Incoming Pair code: {}", pair_code);
 
-   #[tokio::test]
-   async fn test_pair_peer_relaxed() {
-      use quinn::Endpoint;
-      let _guard = KNOWN_PEERS_LOCK
-         .lock()
-         .unwrap_or_else(|poisoned| poisoned.into_inner());
-      // generate key and cert for virtual peers
-      let server_config =
-         mtls::configure_server("test-peer-server").expect("failed to configure server crypto");
-      let client_config =
-         mtls::configure_client("test-peer-client").expect("failed to configure client crypto");
-      // initialize the quic server
-      let server = Endpoint::server(
-         server_config,
-         TEST_SOCKET_ADDR.parse().expect("invalid socket addr"),
-      )
-      .expect("failed to create server endpoint");
+      if let Ok(true) = validate_pair_code(pair_code) {
+         let peer_id = peer_key_hash(&connection)?;
+         let peer_name = get_peer_cert_name(&connection)
+            .unwrap_or_else(|| connection.remote_address().to_string());
+         asyncify!(add_known_peer, &peer_id, &peer_name).map_err(AddKnownPeerFailed)?;
 
-      // reuse the same endpoint to connect to the host peer
-      let local_addr = server.local_addr().expect("failed to get local addr");
-      let connection = server
-         .connect_with(client_config, local_addr, "test-peer-server")
-         .expect("failed to connect to server");
-      let mut task_set = JoinSet::new();
-      task_set.spawn(connecting_peer(connection));
-      task_set.spawn(responding_peer(
-         server.accept().await.expect("failed to accept connection"),
-         PairMode::Relaxed,
-      ));
-      task_set.join_all().await;
+         channel_tx.write_all(AuthCommands::ACCEPT).await?;
+         // Wait for the client to finish the handshake stream, but don't let a
+         // stalled client pin this task: on timeout keep the (now
+         // authenticated) connection alive.
+         match tokio::time::timeout(HANDSHAKE_TIMEOUT, channel_tx.stopped()).await {
+            Ok(result) => {
+               if let Err(error) = result {
+                  tracing::warn!("peer stopped the handshake stream unexpectedly: {error}");
+               }
+            }
+            Err(_) => {
+               tracing::debug!("handshake stream was not stopped within the timeout");
+            }
+         }
+         return Ok((connection, peer_id));
+      }
+      connect_attempts += 1;
    }
-   // I still need to figure out how to write the other tests
+   connection.close(AuthenticationFailure.into(), PAIRING_EXHAUSTED_REASON);
+
+   Err(TooManyPairingAttempts)
 }

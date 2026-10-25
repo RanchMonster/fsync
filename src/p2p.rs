@@ -1,22 +1,90 @@
 pub mod auth;
-mod discovery;
-mod error;
-use auth::{AuthError, configure_client, configure_server, get_peer_id, handle_incoming};
-use discovery::{advertise_local_client, handle_event};
-use quinn::Endpoint;
+mod close_code;
+pub mod known_peer;
+mod network;
+use auth::{configure_client, configure_server, handle_incoming};
+use quinn::{Connection, Endpoint, Incoming};
 use std::collections::HashSet;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::LazyLock;
+use tokio::sync::RwLock;
 use tokio::task::{self};
+use tracing::{Instrument, instrument};
 
-use crate::Config;
-pub use crate::p2p::auth::PairMode;
+use crate::p2p::auth::handle_connecting;
+use crate::p2p::known_peer::{PeerId, get_known_peer};
+use crate::p2p::network::{Network, NetworkError, NetworkMember};
+use crate::{Config, asyncify};
 
-const SERVICE_TYPE: &str = "_fsync._udp.local.";
-const VERSION_KEY_PROPERTY: &str = "version";
 const VERSION_NUMBER: &str = env!("CARGO_PKG_VERSION");
-
+pub const HEX_ENCODED_PEER_ID_LENGTH: usize = 64;
 pub const PROTOCOL_NAME: &str = concat!("fsync/", env!("PROTOCOL_VERSION"));
+
+/// keeps track of all the peers we are currently connected to we use this to prevent us from
+/// connecting to the same peer twice
+static CONNECTED_PEERS: LazyLock<RwLock<HashSet<PeerId>>> =
+   LazyLock::new(|| RwLock::new(HashSet::new()));
+#[instrument(skip(connection))]
+fn log_on_disconnect(connection: &Connection, peer_id: PeerId) {
+   let connection = connection.clone();
+   task::spawn(
+      async move {
+         connection.closed().await;
+         CONNECTED_PEERS.write().await.remove(&peer_id);
+         tracing::info!("Peer disconnected");
+      }
+      .in_current_span(),
+   );
+}
+fn handle_incoming_detached(incoming: Incoming) {
+   task::spawn(async move {
+      // the error is handled for us via instrumentation on the functions
+      // see [tracing::instrument](https://docs.rs/tracing/latest/tracing/attr.instrument.html)
+      // for more information
+      let Ok((connection, peer_id)) = handle_incoming(incoming).await else {
+         return;
+      };
+      log_on_disconnect(&connection, peer_id);
+      todo!("pass the connection to the sync module");
+   });
+}
+
+#[instrument(err,skip(network,endpoint),fields(network=network.network_name()))]
+async fn network_handler<Member: NetworkMember + Send + Sync + 'static, Error: NetworkError>(
+   network: &mut impl Network<Member, Error>, endpoint: &Endpoint,
+) -> Result<(), Box<dyn std::error::Error>> {
+   let connected_peers = CONNECTED_PEERS.read().await;
+   let network_members = network
+      .list_members()?
+      .into_iter()
+      .filter(|members| !connected_peers.contains(&members.id()))
+      .collect::<Vec<_>>();
+   for member in network_members {
+      let peer_id = member.id();
+      if !asyncify!(get_known_peer, &peer_id)?.is_some() {
+         continue;
+      }
+      match network.connect(endpoint, member).await {
+         Ok(connecting) => {
+            let Ok((_connection, peer_id_from_auth)) = handle_connecting(connecting).await else {
+               continue;
+            };
+            if peer_id != peer_id_from_auth {
+               // this likely means that someone is up to no good
+               tracing::warn!("The peer id doesn't match the public peer id");
+            }
+            todo!("pass the connection to the sync module");
+         }
+         Err(err) => {
+            tracing::error!("Failed to connect to peer: {err}");
+         }
+      }
+   }
+
+   todo!();
+}
+pub async fn is_connected(peer_id: &PeerId) -> bool {
+   CONNECTED_PEERS.read().await.contains(peer_id)
+}
 
 pub async fn start_service(config: &'static Config) -> ! {
    // load args from the config given
@@ -29,7 +97,6 @@ pub async fn start_service(config: &'static Config) -> ! {
    );
    let config_address = &config.address;
    let config_port = config.port;
-   let pair_mode = &config.pair_mode;
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname).expect("Failed to configure server");
@@ -50,56 +117,11 @@ pub async fn start_service(config: &'static Config) -> ! {
 
    let local_addr = endpoint.local_addr().expect("Failed to get local address");
    tracing::debug!("Listening on {local_addr}");
+   // let mut local_network = LocalNetwork::new(local_addr, peer_id, hostname);
 
-   let peer_id = get_peer_id(&hostname).expect("Failed to get peer id");
-   tracing::debug!("Advertising {hostname} as {peer_id}");
-
-   // start the advertisement daemon
-   let advertising_daemon = advertise_local_client(local_addr, hostname, &peer_id).await;
-   tracing::debug!("Looking for peers");
-
-   let browser = advertising_daemon
-      .browse(SERVICE_TYPE)
-      .expect("Failed to browse for peers");
-
-   // Define event loop variables
-   let discovered_peers = Arc::new(Mutex::new(HashSet::new()));
-   // event loop for the service
    loop {
-      tokio::select! {
-         accept = endpoint.accept() => {
-            let incoming = accept.expect("Server closed unexpectedly");
-            tracing::debug!("Accepted connection {incoming:?}");
-
-            match handle_incoming(incoming, pair_mode).await {
-               Ok(_connection) => {
-                  tracing::debug!("Connection accepted, handling is not implemented yet");
-               }
-               Err(err) => match err {
-                  AuthError::Quic(quic_error) => {
-                     tracing::error!("Failed to handle connection to {local_addr:?}: {quic_error}");
-                  }
-                  reason => {
-                     tracing::warn!("Rejected connection to {local_addr:?}: {reason}");
-                  }
-               },
-            }
-         }
-         event = browser.recv_async() => {
-            let event = event.expect("Unexpectedly closed mdns browser");
-            let discovered_peers = discovered_peers.clone();
-            let endpoint = endpoint.clone();
-
-            match task::spawn(handle_event(event, endpoint, discovered_peers))
-               .await
-               .expect("Thread unexpectedly panicked")
-            {
-               Ok(_) => continue,
-               Err(err) => {
-                  tracing::error!("Failed to handle service event: {err}");
-               }
-            }
-         }
-      }
+      let accept = endpoint.accept().await.expect("Server closed unexpectedly");
+      tracing::debug!("Accepted connection {accept:?}");
+      handle_incoming_detached(accept);
    }
 }
