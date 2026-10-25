@@ -10,7 +10,6 @@ use tokio::sync::Mutex;
 use tokio::task::{self};
 
 use crate::Config;
-pub use crate::p2p::auth::PairMode;
 
 const SERVICE_TYPE: &str = "_fsync._udp.local.";
 const VERSION_KEY_PROPERTY: &str = "version";
@@ -29,7 +28,6 @@ pub async fn start_service(config: &'static Config) -> ! {
    );
    let config_address = &config.address;
    let config_port = config.port;
-   let pair_mode = &config.pair_mode;
 
    // configure the serve and attempt to locate peers on the network that we can talk to
    let server_config = configure_server(&hostname).expect("Failed to configure server");
@@ -71,7 +69,8 @@ pub async fn start_service(config: &'static Config) -> ! {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
 
-            match handle_incoming(incoming, pair_mode).await {
+
+            match handle_incoming(incoming).await {
                Ok(_connection) => {
                   tracing::debug!("Connection accepted, handling is not implemented yet");
                }
