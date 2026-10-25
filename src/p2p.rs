@@ -71,7 +71,7 @@ pub async fn start_service(config: &'static Config) -> ! {
             let incoming = accept.expect("Server closed unexpectedly");
             tracing::debug!("Accepted connection {incoming:?}");
 
-            match handle_incoming(incoming, &pair_mode).await {
+            match handle_incoming(incoming, pair_mode).await {
                Ok(_connection) => {
                   tracing::debug!("Connection accepted, handling is not implemented yet");
                }

@@ -40,7 +40,7 @@ pub static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
          remove_dir_all(&debug_dir).expect("Failed to remove old config dir.");
       }
       create_dir_all(&debug_dir).expect("Failed to create config dir.");
-      return debug_dir;
+      debug_dir
    }
    #[cfg(not(debug_assertions))]
    {
@@ -63,7 +63,7 @@ pub static DATA_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
          remove_dir_all(&debug_dir).expect("Failed to remove old data dir.");
       }
       create_dir_all(&debug_dir).expect("Failed to create data dir.");
-      return debug_dir;
+      debug_dir
    }
    #[cfg(not(debug_assertions))]
    {
@@ -85,7 +85,7 @@ pub static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
          remove_dir_all(&debug_dir).expect("Failed to remove old cache dir.");
       }
       create_dir_all(&debug_dir).expect("Failed to create cache dir.");
-      return debug_dir;
+      debug_dir
    }
    #[cfg(not(debug_assertions))]
    {
