@@ -16,5 +16,9 @@ check:
 dep-tree:
    cargo tree
 
-fmt: 
-   cargo fmt
+clippy:
+   cargo clippy --fix --all-targets
+   cargo check --all-targets
+   cargo fmt --all
+   cargo test
+
